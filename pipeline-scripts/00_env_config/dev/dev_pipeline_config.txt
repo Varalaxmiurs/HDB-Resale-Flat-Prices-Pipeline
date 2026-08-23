@@ -1,0 +1,30 @@
+# ============================================================
+# dev_pipeline_config.txt - Consolidated Pipeline Configuration
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. COMMON / INFRASTRUCTURE CONFIGURATION
+# ------------------------------------------------------------
+DATABASE_NAME=resaleflat_db
+ATHENA_WORKGROUP=primary
+METADATA_BUCKET=data_driven
+AWS_REGION=ap-southeast-1
+CONTEXT_KEY=pipeline-scripts/json_context/pipeline_context.json
+ATHENA_RESULTS_LOCATION=s3://data_driven/athena-results/
+
+# ------------------------------------------------------------
+# 2. STAGE 1: BRONZE LAYER INGESTION CONFIGURATION
+# ------------------------------------------------------------
+BRONZE_TARGET_LAYER=bronze
+BRONZE_LOAD_TYPE=APPEND
+BRONZE_SOURCE_PATH=raw/data/resaleflat_price/
+BRONZE_TABLE_NAME=resaleflat_price
+
+# ------------------------------------------------------------
+# 3. STAGE 2: SILVER LAYER TRANSFORMATION & DQ CONFIGURATION
+# ------------------------------------------------------------
+SILVER_TARGET_LAYER=silver
+SILVER_LOAD_TYPE=MERGE
+SILVER_WATERMARK_COLUMN=ingestion_timestamp
+SILVER_PRIMARY_KEYS=month,town,flat_type,block,street_name,storey_range
+DQ_MAX_FAILURE_THRESHOLD=0

@@ -1,0 +1,26 @@
+cat <<'EOF' > trust-policy.json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::544795558120:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:Varalaxmiurs/HDB-resleflat-price:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+aws iam create-role \
+  --role-name hdb-pipeline-github-actions \
+  --assume-role-policy-document file://trust-policy.json

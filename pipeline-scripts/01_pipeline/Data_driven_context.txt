@@ -1,0 +1,74 @@
+# Initialize Metadata Manager
+manager = MetadataPipelineManager(
+    database=DATABASE_NAME,
+    workgroup=ATHENA_WORKGROUP,
+    output_s3=ATHENA_OUTPUT_BUCKET
+)
+
+try:
+    # 1. Fetch Metadata Context & Existing Watermark
+    bronze_context = manager.get_pipeline_context("resaleflat_price_bronze")
+    print(f"Executing with Watermark > {bronze_context['current_watermark']}")
+    
+    # Start Execution Logging
+    manager.start_layer_run("HDB_Resale_Pipeline", "ALL_LAYERS", "raw_csv", "gold_hashed")
+
+    # 2. Run Pipeline Stages
+    # (Extract df_raw, df_cleaned, df_transformed, df_all_failed, df_final_hashed)
+    # ...
+    
+    # 3. Calculate Final Counts
+    raw_cnt = len(df_raw)
+    cleaned_cnt = len(df_cleaned)
+    val_fail_cnt = len(df_failed_validation)
+    dup_discard_cnt = len(df_failed_duplicates)
+    total_fail_cnt = len(df_all_failed)
+    hashed_cnt = len(df_final_hashed)
+    
+    # 4. Reconciliation Balance Check
+    is_balanced = (raw_cnt == cleaned_cnt + total_fail_cnt) and (cleaned_cnt == hashed_cnt)
+    status_str = "SUCCEEDED" if is_balanced else "FAILED_RECONCILIATION"
+    
+    # Determine New High Watermark (max transaction month)
+    new_high_watermark = df_raw['month'].max()
+
+    # 5. Update Watermarks & Log Pipeline Metrics
+    manager.update_watermark("resaleflat_price_bronze", "month", new_high_watermark)
+    manager.complete_layer_run(
+        layer="FULL_MEDALLION",
+        status=status_str,
+        read_cnt=raw_cnt,
+        written_cnt=hashed_cnt,
+        failed_cnt=total_fail_cnt
+    )
+
+    # 6. Send Reconciliation Summary Email via SNS
+    summary_metrics = {
+        "status": status_str,
+        "raw_count": raw_cnt,
+        "cleaned_count": cleaned_cnt,
+        "failed_validation_count": val_fail_cnt,
+        "duplicate_discards_count": dup_discard_cnt,
+        "total_failed_count": total_fail_cnt,
+        "hashed_count": hashed_cnt,
+        "reconciliation_status": "BALANCED (100% Match)" if is_balanced else "UNBALANCED MISMATCH",
+        "new_watermark": new_high_watermark,
+        "error_message": "None" if is_balanced else "Row count mismatch between Raw vs (Hashed + Failed)"
+    }
+    manager.send_execution_summary_email(summary_metrics)
+
+except Exception as e:
+    # Log failure to metadata table and dispatch failure alert
+    manager.complete_layer_run(
+        layer="FULL_MEDALLION",
+        status="FAILED",
+        read_cnt=0,
+        written_cnt=0,
+        failed_cnt=0,
+        error_msg=str(e)
+    )
+    manager.send_execution_summary_email({
+        "status": "FAILED",
+        "error_message": str(e)
+    })
+    raise e
