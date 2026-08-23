@@ -1,0 +1,53 @@
+name: Deploy HDB pipeline scripts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pipeline-scripts/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "pipeline-scripts/**"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  AWS_ROLE_ARN: arn:aws:iam::544795558120:role/hdb-pipeline-github-actions
+  PIPELINE_BUCKET: hdb-eventdriven-pipeline-scripts
+  PIPELINE_PREFIX: python-scripts
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Syntax-check every Python file under pipeline-scripts/
+        run: |
+          find pipeline-scripts -name "*.py" -print0 | xargs -0 -n1 python -m py_compile
+
+  deploy:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Sync pipeline-scripts/ to S3
+        run: |
+          aws s3 sync pipeline-scripts/ "s3://${PIPELINE_BUCKET}/${PIPELINE_PREFIX}/" \
+            --region "${AWS_REGION}"
+      - name: Show what's live in S3
+        run: |
+          aws s3 ls "s3://${PIPELINE_BUCKET}/${PIPELINE_PREFIX}/" --recursive --region "${AWS_REGION}"
