@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 lambda_function.zip
+trust-policy.json
+github-actions-s3-policy.json
