@@ -507,10 +507,12 @@ echo "============================================================"
 # Lets GitHub Actions assume an AWS role via short-lived OIDC tokens
 # instead of long-lived access keys stored as repo secrets.
 GITHUB_ORG_REPO="${GITHUB_ORG_REPO:-Varalaxmiurs/HDB-resleflat-price}"
+GITHUB_ORG="${GITHUB_ORG_REPO%%/*}"
+GITHUB_REPO_NAME="${GITHUB_ORG_REPO#*/}"
 GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
 GITHUB_OIDC_HOST="token.actions.githubusercontent.com"
 GITHUB_OIDC_THUMBPRINT="6938fd4d98bab03faadb97b34396831e3780aea1"
-GHA_ROLE_NAME="${PROJECT_NAME}-github-actions"
+GHA_ROLE_NAME="${GITHUB_ACTIONS_ROLE_NAME:-hdb-pipeline-github-actions}"  # matches the role already created by hand - do not rename without also updating the workflow YAML's role-to-assume
 
 if aws iam list-open-id-connect-providers \
     --query "OpenIDConnectProviderList[?ends_with(Arn, '${GITHUB_OIDC_HOST}')]" \
@@ -532,6 +534,13 @@ else
 
 fi
 
+# Wildcards (*) around the org/repo names below are load-bearing, not
+# cosmetic: GitHub appends a numeric owner/repo ID to the OIDC token's sub
+# claim (e.g. "repo:Org@123/Repo@456:ref:...") once a repo or account has
+# ever been renamed, so an old exact-match policy silently stops matching.
+# Confirmed via CloudTrail (AssumeRoleWithWebIdentity AccessDenied events)
+# on this repo - the wildcard version matches both the plain and ID-suffixed
+# forms.
 GHA_TRUST_POLICY=$(cat <<JSON
 {
   "Version": "2012-10-17",
@@ -547,7 +556,7 @@ GHA_TRUST_POLICY=$(cat <<JSON
           "${GITHUB_OIDC_HOST}:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "${GITHUB_OIDC_HOST}:sub": "repo:${GITHUB_ORG_REPO}:ref:refs/heads/${GITHUB_BRANCH}"
+          "${GITHUB_OIDC_HOST}:sub": "repo:${GITHUB_ORG}*/${GITHUB_REPO_NAME}*:ref:refs/heads/${GITHUB_BRANCH}"
         }
       }
     }
@@ -586,18 +595,46 @@ fi
 # Scoped to only what the deploy workflow needs: write the pipeline scripts
 # to S3, start/inspect the Glue jobs, and publish to the real SNS topic
 # created in STEP 8 (not a hardcoded/guessed ARN).
-GHA_PERMISSIONS_POLICY=$(cat <<JSON
+#
+# Split into the two inline policies that are actually attached to the role
+# in AWS today. GitHubActionsS3PipelineAccess was applied by hand (via
+# put-role-policy) to unblock the "Sync pipeline-scripts/ to S3" step before
+# this part of setup.sh had ever been run - s3:ListBucket needs the bucket
+# ARN itself as a resource (not just bucket/*), which is what actually fixed
+# the AccessDenied error. Keeping the same policy name here means re-running
+# setup.sh updates that exact policy in place instead of creating a third,
+# differently-named duplicate. Glue/SNS stay in a separate policy since the
+# current workflow doesn't touch them yet - add steps that call Glue or
+# publish SNS alerts from CI and this policy already covers it.
+GHA_S3_POLICY=$(cat <<JSON
 {
   "Version": "2012-10-17",
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::${PIPELINE_BUCKET}",
-        "arn:aws:s3:::${PIPELINE_BUCKET}/*"
-      ]
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::${PIPELINE_BUCKET}"
     },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::${PIPELINE_BUCKET}/*"
+    }
+  ]
+}
+JSON
+)
+
+aws iam put-role-policy \
+    --role-name "${GHA_ROLE_NAME}" \
+    --policy-name "GitHubActionsS3PipelineAccess" \
+    --policy-document "${GHA_S3_POLICY}" \
+    >/dev/null
+
+GHA_GLUE_SNS_POLICY=$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
     {
       "Effect": "Allow",
       "Action": ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJob"],
@@ -615,8 +652,8 @@ JSON
 
 aws iam put-role-policy \
     --role-name "${GHA_ROLE_NAME}" \
-    --policy-name "${PROJECT_NAME}-github-actions-permissions" \
-    --policy-document "${GHA_PERMISSIONS_POLICY}" \
+    --policy-name "${PROJECT_NAME}-github-actions-glue-sns" \
+    --policy-document "${GHA_GLUE_SNS_POLICY}" \
     >/dev/null
 
 GHA_ROLE_ARN="$(aws iam get-role \
