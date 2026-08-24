@@ -34,7 +34,7 @@ from datetime import date
 
 import pandas as pd
 
-from common import get_logger, merge_iceberg, read_iceberg, record_audit, route_to_failed
+from common import get_logger, read_iceberg, record_audit, route_to_failed, write_by_load_type
 from config import LEASE_YEARS
 
 logger = get_logger("job_3_cleaned_iceberg")
@@ -166,7 +166,7 @@ def main() -> None:
     anomalous = kept[anomaly_mask]
     route_to_failed(anomalous, reason="anomalous_price_iqr_outlier", stage="cleaned")
 
-    merge_iceberg(clean_final, stage="cleaned")  # idempotent upsert on surrogate_key (carried from raw)
+    write_by_load_type(clean_final, stage="cleaned", table_id=1)  # FULL/MERGE decided by table_parameters
     total_rejected = len(field_failed) + len(discarded_dupes) + len(anomalous)
     logger.info(
         "job_3 complete: %d passed to cleaned_iceberg, %d field-rejects, %d dupes, %d anomalies",

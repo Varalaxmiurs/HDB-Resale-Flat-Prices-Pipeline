@@ -20,7 +20,7 @@ Implements the Data Transformation Requirements from the test brief:
 
 import pandas as pd
 
-from common import get_logger, merge_iceberg, read_iceberg, record_audit, route_to_failed
+from common import get_logger, read_iceberg, record_audit, route_to_failed, write_by_load_type
 
 logger = get_logger("job_4_transformed_iceberg")
 
@@ -101,7 +101,7 @@ def main() -> None:
     kept, discarded_dupes = resolve_duplicates(valid)
     route_to_failed(discarded_dupes, reason="duplicate_key_lower_price", stage="transformed")
 
-    merge_iceberg(kept, stage="transformed")  # idempotent upsert on surrogate_key (carried from cleaned)
+    write_by_load_type(kept, stage="transformed", table_id=1)  # FULL/MERGE decided by table_parameters
     logger.info(
         "job_4 complete: %d passed to transformed_iceberg, %d identifier-rejects, %d dupes",
         len(kept), len(invalid), len(discarded_dupes),

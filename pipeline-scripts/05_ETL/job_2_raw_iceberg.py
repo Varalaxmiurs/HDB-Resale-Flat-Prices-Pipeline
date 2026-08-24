@@ -11,8 +11,13 @@ bare minimum transformation needed to make the table usable downstream:
     - drop rows that are entirely blank (a rare artifact of source CSVs)
     - compute the deterministic surrogate_key (SHA-256 of the composite
       natural key, per common.compute_surrogate_key / config.NATURAL_KEY_COLUMNS)
-      so raw_iceberg - and every stage after it - can be idempotently
-      upserted via merge_iceberg() on rerun.
+      - carried forward by every stage after this one, and used by job_5's
+      SCD2 change detection.
+
+Written via overwrite_iceberg(), not merge_iceberg(): job_1's source pull is
+always the FULL "Resale Flat Prices" collection, never a delta, so each run
+here fully replaces raw_iceberg's contents rather than upserting into it -
+see common.py's overwrite_iceberg() docstring for the reasoning.
 
 No field validation, deduplication, or business-rule cleaning happens here
 - that belongs to job_3. This stage is intentionally "as close to source as
@@ -32,7 +37,7 @@ the source-file read (wr.s3.read_csv over the whole source prefix) and the
 import awswrangler as wr
 import pandas as pd
 
-from common import compute_surrogate_key, get_logger, merge_iceberg, record_audit
+from common import compute_surrogate_key, get_logger, record_audit, write_by_load_type
 from config import SOURCE_S3_BUCKET, SOURCE_S3_PREFIX
 
 logger = get_logger("job_2_raw_iceberg")
@@ -55,9 +60,9 @@ def main() -> None:
     dropped_blank = len(source_df) - len(raw_df)
     raw_df["surrogate_key"] = compute_surrogate_key(raw_df)
 
-    merge_iceberg(raw_df, stage="raw")  # idempotent upsert on surrogate_key
+    write_by_load_type(raw_df, stage="raw", table_id=1)  # FULL/MERGE decided by table_parameters, not hardcoded here
     logger.info(
-        "job_2 complete: %d rows merged into raw_iceberg (%d fully-blank rows dropped)",
+        "job_2 complete: %d rows loaded into raw_iceberg (%d fully-blank rows dropped)",
         len(raw_df), dropped_blank,
     )
     record_audit(

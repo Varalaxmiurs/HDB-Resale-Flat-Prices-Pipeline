@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from common import execute_athena_sql, get_logger, read_iceberg, record_audit, route_to_failed, write_iceberg
+from common import athena_read_sql, execute_athena_sql, get_logger, read_iceberg, record_audit, route_to_failed, write_iceberg
 from config import ATTRIBUTE_COLUMNS_FOR_CHANGE_DETECTION, GLUE_DATABASE
 
 logger = get_logger("job_5_hashed_iceberg")
@@ -65,12 +65,9 @@ def read_current_versions() -> pd.DataFrame:
     Returns an empty frame (not an error) if the table doesn't exist yet -
     that's expected on the very first run.
     """
-    import awswrangler as wr
     try:
-        return wr.athena.read_sql_query(
-            sql='SELECT surrogate_key, row_hash, version FROM "hashed_iceberg" WHERE is_current = true',
-            database=GLUE_DATABASE,
-            ctas_approach=False,
+        return athena_read_sql(
+            'SELECT surrogate_key, row_hash, version FROM "hashed_iceberg" WHERE is_current = true'
         )
     except Exception:
         logger.info("hashed_iceberg not queryable yet (first run) - treating current versions as empty")
@@ -119,9 +116,28 @@ def apply_scd2(incoming_df: pd.DataFrame) -> pd.DataFrame:
     if to_write.empty:
         return to_write
 
-    to_write["version"] = to_write["version"].fillna(0).astype(int) + 1  # NaN (new) -> 0+1 = 1
-    to_write["effective_start_date"] = _now_ts()
-    to_write["effective_end_date"] = None
+    # .infer_objects(copy=False) between fillna() and astype(int): fillna()
+    # on this object-dtype column (float for existing rows, NaN for brand
+    # new ones) used to silently downcast to a numeric dtype on its own;
+    # newer pandas warns that behaviour is going away and wants it done
+    # explicitly - this is pandas' own suggested fix, not a functional
+    # change (NaN (new) -> 0+1 = 1, same as before).
+    to_write["version"] = to_write["version"].fillna(0).infer_objects(copy=False).astype(int) + 1
+
+    # effective_start_date/effective_end_date must be typed as real pandas
+    # datetime64 values, not plain strings/None - a column that's ALL None
+    # (every row here has effective_end_date=NULL on write; it only gets
+    # set later by expire_current_rows()'s UPDATE) comes out as pandas'
+    # generic "object" dtype, which awswrangler can't map to an Iceberg
+    # column type at all ("Impossible to infer the equivalent Athena data
+    # type... too generic data type (object)") - hit on a real first run,
+    # since CREATE TABLE has no existing schema to fall back on. Assigning
+    # real pd.Timestamp/pd.NaT values instead makes pandas infer
+    # datetime64[ns] for both columns, which awswrangler maps to Iceberg's
+    # TIMESTAMP - matching what expire_current_rows()'s SQL already assumes.
+    now_ts = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    to_write["effective_start_date"] = now_ts
+    to_write["effective_end_date"] = pd.NaT
     to_write["is_current"] = True
     to_write["scd_key"] = to_write.apply(
         lambda r: hash_value(f"{r['surrogate_key']}#{r['version']}"), axis=1
