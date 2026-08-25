@@ -14,17 +14,27 @@ Implements the Data Quality Requirements from the test brief:
     5. Composite-key duplicate handling: same key, different resale_price
        -> keep the higher price, route the lower one to failed_iceberg.
     6. Anomalous resale price detection via IQR, grouped by town + flat_type.
-    7. Any additional rule you add should also route rejects through
-       route_to_failed() with a clear reason string.
+    7. Additional rules (all routed through route_to_failed() like every
+       other rule above): floor_area_sqm within a realistic HDB range,
+       lease_commence_date's year no later than the transaction's own year
+       (a flat can't be sold before its lease exists), resale_price
+       strictly positive, and up-front text normalization
+       (upper-case + strip on town/street_name/flat_model) so formatting
+       noise can't slip past either the categorical checks or the
+       composite-key dedup below.
 
 ASSUMPTIONS (document these in your final write-up too):
     - lease_commence_date is a year only; lease is assumed to start
-      1 Jan of that year.
-    - "Statistical properties" for categorical validation = build the set
-      of valid values from the dataset's own value_counts(), rather than
-      a hardcoded external list, and flag rows whose value never appears
-      (rather than a fixed frequency threshold, to avoid over-flagging a
-      genuinely clean dataset as the brief notes may be the case).
+      1 Jan of that year. Remaining lease is floored (never rounded up):
+      today's own in-progress month counts as already elapsed - see
+      recompute_remaining_lease()'s BUGFIX comment for why that matters.
+    - "Statistical properties" for categorical validation = a value is
+      valid if it occurs at least MIN_CATEGORY_FREQUENCY (5) times across
+      the master dataset, rather than a hardcoded external whitelist. An
+      earlier version of this rule built its "known good" set from the
+      very column it was validating, which is circular and can never
+      actually reject anything but a blank/null cell - see
+      validate_categorical()'s BUGFIX comment.
     - Anomalous price = outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR] within each
       (town, flat_type) group - a standard, explainable outlier heuristic.
 """
@@ -35,11 +45,35 @@ from datetime import date
 import pandas as pd
 
 from common import get_logger, read_iceberg, record_audit, route_to_failed, write_by_load_type
-from config import LEASE_YEARS
+from config import LEASE_YEARS, MIN_CATEGORY_FREQUENCY
 
 logger = get_logger("job_3_cleaned_iceberg")
 
 STOREY_RANGE_PATTERN = re.compile(r"^\d{2} TO \d{2}$")
+
+# Realistic HDB floor-area sanity range (sqm) - deliberately generous (wide
+# enough to include every real flat type, from 1-room to executive/multi-
+# generation) so this only catches obvious data-entry errors (a misplaced
+# decimal, a unit mix-up), not genuine variation within a flat type.
+FLOOR_AREA_MIN_SQM = 20
+FLOOR_AREA_MAX_SQM = 300
+
+# Free-text categorical columns normalized (upper-case + strip) before any
+# validation or duplicate-key comparison runs, so " Ang Mo Kio" / "ANG MO
+# KIO" / "ang mo kio " aren't treated as 3 different categories
+# (validate_categorical) or 3 different composite keys (resolve_duplicates)
+# when they're really the same value with formatting noise.
+NORMALIZE_TEXT_COLUMNS = ["town", "street_name", "flat_model"]
+
+
+def normalize_text_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Applied once, up front (before validation/dedup) - see
+    NORMALIZE_TEXT_COLUMNS' docstring above for why."""
+    df = df.copy()
+    for col in NORMALIZE_TEXT_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.upper().str.strip()
+    return df
 
 
 # --------------------------------------------------------------------------- #
@@ -54,18 +88,52 @@ def validate_date(df: pd.DataFrame) -> pd.Series:
 
 def validate_categorical(df: pd.DataFrame, column: str) -> pd.Series:
     """
-    Valid = value is one of the values that actually occur in the dataset's
-    own distribution (i.e. non-null, non-blank). This catches nulls/blank
-    strings/obvious garbage without hardcoding an external whitelist of
-    towns/flat types/models, per the "statistical properties" requirement.
+    Valid = value is non-null/non-blank AND occurs at least
+    MIN_CATEGORY_FREQUENCY times across the master dataset - a value that
+    appears only once or twice is statistically far more likely to be a
+    typo or garbage than a genuinely rare-but-valid category, given how
+    heavily each real town/flat_type/flat_model value repeats across
+    thousands of transactions. See MIN_CATEGORY_FREQUENCY's module-level
+    docstring for the full rationale (this replaced an earlier, circular
+    version of this check - see the BUGFIX note above it).
     """
     values = df[column].astype(str).str.strip()
-    known_values = set(values[values != ""].unique())
-    return values.isin(known_values) & (values != "") & df[column].notna()
+    non_blank = (values != "") & df[column].notna()
+    frequency = values.map(values[non_blank].value_counts())
+    return non_blank & (frequency >= MIN_CATEGORY_FREQUENCY)
 
 
 def validate_storey_range(df: pd.DataFrame) -> pd.Series:
     return df["storey_range"].astype(str).str.strip().str.match(STOREY_RANGE_PATTERN)
+
+
+def validate_floor_area_bounds(df: pd.DataFrame) -> pd.Series:
+    """floor_area_sqm must fall within a realistic HDB range - see
+    FLOOR_AREA_MIN_SQM/MAX_SQM's docstring above."""
+    area = pd.to_numeric(df["floor_area_sqm"], errors="coerce")
+    return area.notna() & (area >= FLOOR_AREA_MIN_SQM) & (area <= FLOOR_AREA_MAX_SQM)
+
+
+def validate_lease_commence_vs_transaction(df: pd.DataFrame) -> pd.Series:
+    """A flat cannot be sold before its own lease commences -
+    lease_commence_date's year must be <= the transaction month's year."""
+    def _valid(lease_year, month_str) -> bool:
+        try:
+            return int(lease_year) <= int(str(month_str).split("-")[0])
+        except (TypeError, ValueError, IndexError):
+            return False
+    return pd.Series(
+        [_valid(ly, m) for ly, m in zip(df["lease_commence_date"], df["month"])], index=df.index
+    )
+
+
+def validate_resale_price_positive(df: pd.DataFrame) -> pd.Series:
+    """resale_price must be a real, positive number - checked explicitly,
+    up front, before flag_anomalous_price()'s IQR check runs (a zero/
+    negative price would otherwise just get silently averaged into that
+    group's quartiles rather than being rejected outright)."""
+    price = pd.to_numeric(df["resale_price"], errors="coerce")
+    return price.notna() & (price > 0)
 
 
 def run_field_validations(df: pd.DataFrame) -> pd.DataFrame:
@@ -76,6 +144,9 @@ def run_field_validations(df: pd.DataFrame) -> pd.DataFrame:
         "invalid_flat_type": ~validate_categorical(df, "flat_type"),
         "invalid_flat_model": ~validate_categorical(df, "flat_model"),
         "invalid_storey_range": ~validate_storey_range(df),
+        "invalid_floor_area": ~validate_floor_area_bounds(df),
+        "lease_commence_after_transaction": ~validate_lease_commence_vs_transaction(df),
+        "invalid_resale_price": ~validate_resale_price_positive(df),
     }
     errors = pd.Series([[] for _ in range(len(df))], index=df.index)
     for rule_name, failed_mask in checks.items():
@@ -99,7 +170,18 @@ def recompute_remaining_lease(df: pd.DataFrame) -> pd.DataFrame:
         except (TypeError, ValueError):
             return pd.Series({"remaining_lease_years": None, "remaining_lease_months": None})
 
+        # BUGFIX (2026-08-25): "rounded down" means remaining lease should be
+        # TRUNCATED (never overstated) - any partial month already in
+        # progress today counts as already elapsed, not as still remaining.
+        # The previous formula used (today.month - 1), which leaves today's
+        # own partial month out of "elapsed" entirely - every day past the
+        # 1st of the month, that quietly credited one extra month onto
+        # "remaining" (rounding UP, the opposite of what the brief asks
+        # for). Adding 1 once we're past day 1 makes the current in-progress
+        # month count as elapsed too, so remaining is always floored.
         elapsed_months = (today.year - commence_year) * 12 + (today.month - 1)  # assume Jan commencement
+        if today.day > 1:
+            elapsed_months += 1
         remaining_months_total = LEASE_YEARS * 12 - elapsed_months
         remaining_months_total = max(remaining_months_total, 0)
         return pd.Series({
@@ -148,6 +230,8 @@ def flag_anomalous_price(df: pd.DataFrame) -> pd.Series:
 def main() -> None:
     raw_df = read_iceberg("raw")
     logger.info("Read %d rows from raw_iceberg", len(raw_df))
+
+    raw_df = normalize_text_columns(raw_df)  # before any validation/dedup - see its docstring
 
     validated = run_field_validations(raw_df)
     field_failed_mask = validated["_validation_errors"].apply(len).gt(0)

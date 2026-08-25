@@ -23,8 +23,39 @@ How to override locally (Git Bash):
 """
 
 import os
+import sys
 
 import boto3
+
+
+def _bridge_glue_job_arguments() -> None:
+    """AWS Glue Job Arguments arrive as '--KEY VALUE' pairs in sys.argv,
+    NOT as OS environment variables - so exporting an HDB_* env var
+    locally (e.g. HDB_MAX_ROWS, HDB_PROJECT_NAME) has no effect on a real
+    `aws glue start-job-run --arguments '{"--HDB_MAX_ROWS":"1000"}'` run
+    unless something bridges the two. This does that bridge: any
+    '--HDB_...' argument becomes the equivalent os.environ entry, so every
+    _env()/_env_int() call below (and everywhere else in this file) sees
+    it exactly the same way it would from a local `export`. Deliberately
+    plain sys.argv parsing rather than the `awsglue` library's
+    getResolvedOptions() - that library isn't guaranteed present in every
+    Glue Python Shell runtime, and this needs zero extra dependency.
+    No-op for local runs (sys.argv never has '--HDB_...' entries there),
+    and setdefault() means a real env var already set wins if somehow
+    both are present.
+    """
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--HDB_") and i + 1 < len(args):
+            os.environ.setdefault(arg[2:], args[i + 1])
+            i += 2
+        else:
+            i += 1
+
+
+_bridge_glue_job_arguments()
 
 
 def _env(key: str, default: str) -> str:
@@ -91,6 +122,25 @@ def _env_or_ssm(env_key: str, ssm_name: str, default: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Project name - drives every resource name below by default
+# --------------------------------------------------------------------------- #
+# Reads the SAME PROJECT_NAME env var setup.sh/tear_down.sh read (falls back to
+# HDB_PROJECT_NAME for a Python-only override), so exporting ONE variable before
+# running either setup.sh or the Python pipeline points BOTH at the same
+# isolated environment - e.g. a parallel test deployment in another region:
+#     export PROJECT_NAME=hdb-eventdriven-test
+#     export AWS_REGION=ap-southeast-1
+#     bash setup.sh                 # provisions mission-hdb-eventdriven-test-*
+#     python run_pipeline.py        # now targets the SAME -test- resources
+# Every individual HDB_*_BUCKET / HDB_GLUE_DATABASE / HDB_SNS_TOPIC_NAME env
+# var below still overrides its own derived default individually, same as
+# always - this just changes what the DEFAULT is when you have not set one.
+PROJECT_NAME = _env("PROJECT_NAME", _env("HDB_PROJECT_NAME", "hdb-eventdriven"))
+_BUCKET_PREFIX = f"mission-{PROJECT_NAME}"
+_DEFAULT_GLUE_DATABASE = f"{PROJECT_NAME.replace('-', '_')}_database"
+_DEFAULT_SNS_TOPIC_NAME = f"{PROJECT_NAME}-notifications"
+
+# --------------------------------------------------------------------------- #
 # AWS region / Glue Catalog / Athena
 # --------------------------------------------------------------------------- #
 
@@ -104,7 +154,7 @@ def _env_or_ssm(env_key: str, ssm_name: str, default: str) -> str:
 # requested entity" / "S3 location ... not in the same region" failures.
 AWS_REGION = _env("AWS_REGION", _env("HDB_AWS_REGION", "us-east-1"))
 
-GLUE_DATABASE = _env("HDB_GLUE_DATABASE", "hdb_eventdriven_database")  # matches setup.sh's ${PROJECT_NAME//-/_}_database
+GLUE_DATABASE = _env("HDB_GLUE_DATABASE", _DEFAULT_GLUE_DATABASE)
 ATHENA_WORKGROUP = _env("HDB_ATHENA_WORKGROUP", "primary")  # must be engine v3 for Iceberg MERGE/UPDATE
 
 # Metadata DB (setup_metadata.py / metadata_tracking.py) - defaults to the
@@ -117,16 +167,40 @@ METADATA_ATHENA_WORKGROUP = _env("HDB_METADATA_WORKGROUP", ATHENA_WORKGROUP)
 # S3 buckets - matches the real bucket structure (8 buckets)
 # --------------------------------------------------------------------------- #
 
-SOURCE_S3_BUCKET = _env("HDB_SOURCE_BUCKET", "mission-hdb-eventdriven-source")
-SOURCE_S3_PREFIX = _env("HDB_SOURCE_PREFIX", "resale-flat-prices")
+SOURCE_S3_BUCKET = _env("HDB_SOURCE_BUCKET", f"{_BUCKET_PREFIX}-source")
 
-RAW_S3_BUCKET = _env("HDB_RAW_BUCKET", "mission-hdb-eventdriven-raw")
-CLEANED_S3_BUCKET = _env("HDB_CLEANED_BUCKET", "mission-hdb-eventdriven-cleaned")
-TRANSFORMED_S3_BUCKET = _env("HDB_TRANSFORMED_BUCKET", "mission-hdb-eventdriven-transformed")
-HASHED_S3_BUCKET = _env("HDB_HASHED_BUCKET", "mission-hdb-eventdriven-hashed")
-FAILED_S3_BUCKET = _env("HDB_FAILED_BUCKET", "mission-hdb-eventdriven-failed")
-AUDIT_S3_BUCKET = _env("HDB_AUDIT_BUCKET", "mission-hdb-eventdriven-audit-tables")
-PIPELINE_SCRIPTS_S3_BUCKET = _env("HDB_SCRIPTS_BUCKET", "mission-hdb-eventdriven-pipeline-scripts")
+# job_1's automated data.gov.sg pull lands here. Standardized name (both
+# prefixes share the "resale-flat-prices-" stem, distinguished by suffix)
+# so the two entry points read as a matched pair in the console, not one
+# named thing plus one generic afterthought.
+SOURCE_S3_PREFIX = _env("HDB_SOURCE_PREFIX", "resale-flat-prices-API-ingestion")
+
+# A SECOND way a file gets into the pipeline besides job_1's automated
+# data.gov.sg pull: someone drops a CSV directly under this prefix, in the
+# SAME source bucket. job_2 reads BOTH prefixes every run and combines them
+# (see job_2_raw_iceberg.py's read_source_files()) - a manually-uploaded
+# file is not a special case handled only at ingestion, it is processed by
+# every downstream stage (cleaned/transformed/hashed/failed) exactly the
+# same as an automated one. Kept as its own prefix (not mixed into
+# SOURCE_S3_PREFIX) so an EventBridge rule can watch ONLY this prefix for
+# "Object Created" and start the pipeline immediately on a manual upload,
+# without also double-firing on every file job_1's own automated run lands
+# under SOURCE_S3_PREFIX (that path is already covered by the separate
+# job_1-SUCCEEDED trigger - see setup.sh Step 11D).
+SOURCE_MANUAL_UPLOAD_PREFIX = _env("HDB_SOURCE_MANUAL_UPLOAD_PREFIX", "resale-flat-prices-manual-upload")
+
+# NOTE (2026-08-25): archiving of processed source files to a separate
+# bucket was removed per request. Source files are read in place by job_2
+# and simply left there - safe to reprocess since raw_iceberg is a full
+# overwrite every run.
+
+RAW_S3_BUCKET = _env("HDB_RAW_BUCKET", f"{_BUCKET_PREFIX}-raw")
+CLEANED_S3_BUCKET = _env("HDB_CLEANED_BUCKET", f"{_BUCKET_PREFIX}-cleaned")
+TRANSFORMED_S3_BUCKET = _env("HDB_TRANSFORMED_BUCKET", f"{_BUCKET_PREFIX}-transformed")
+HASHED_S3_BUCKET = _env("HDB_HASHED_BUCKET", f"{_BUCKET_PREFIX}-hashed")
+FAILED_S3_BUCKET = _env("HDB_FAILED_BUCKET", f"{_BUCKET_PREFIX}-failed")
+AUDIT_S3_BUCKET = _env("HDB_AUDIT_BUCKET", f"{_BUCKET_PREFIX}-audit-tables")
+PIPELINE_SCRIPTS_S3_BUCKET = _env("HDB_SCRIPTS_BUCKET", f"{_BUCKET_PREFIX}-pipeline-scripts")
 
 TABLES = {
     "raw":         ("raw_iceberg",         f"s3://{RAW_S3_BUCKET}/raw_iceberg/"),
@@ -158,6 +232,38 @@ POLL_INTERVAL_SECONDS = _env_int("HDB_POLL_INTERVAL_SECONDS", 5)
 POLL_TIMEOUT_SECONDS = _env_int("HDB_POLL_TIMEOUT_SECONDS", 300)
 REQUEST_TIMEOUT_SECONDS = _env_int("HDB_REQUEST_TIMEOUT_SECONDS", 30)
 
+# job_1's data.gov.sg calls can hit 429 Too Many Requests when several
+# dataset downloads are initiated back-to-back in one run (seen on a real
+# run: 3 overlapping datasets, the 2nd's initiate-download got 429'd
+# immediately after the 1st succeeded). Retried with exponential backoff
+# (doubling each attempt) - honors the API's own Retry-After header when
+# it sends one, falls back to the backoff schedule otherwise. Not a sign
+# of a broken pipeline - a public API being asked for several downloads
+# in quick succession is expected to rate-limit sometimes.
+MAX_API_RETRIES = _env_int("HDB_MAX_API_RETRIES", 5)
+RETRY_BACKOFF_BASE_SECONDS = _env_int("HDB_RETRY_BACKOFF_BASE_SECONDS", 2)
+
+# Testing knob: cap how many datasets job_1 actually downloads/ingests,
+# regardless of how many the date range matches. 0 (default) = no cap,
+# ingest everything the range matches - the real run. Set
+# HDB_MAX_DATASETS=2 for a cheap end-to-end test of the whole pipeline
+# (Step Functions, all 6 jobs, alerting) without paying for a full
+# historical pull every time you're just testing plumbing, not data
+# correctness. Unset it (or set back to 0) before the real ingestion run.
+# TESTING-ONLY - remove this env var (and its 2 call sites in job_1) before final deployment.
+MAX_DATASETS_TO_INGEST = _env_int("HDB_MAX_DATASETS", 0)
+
+# Testing knob: cap total ROW count once files are combined into
+# raw_iceberg (job_2). 0 (default) = no cap - the real run. Setting this
+# caps raw_iceberg's row count directly, which means every downstream
+# stage (cleaned/transformed/hashed) automatically processes <= this many
+# rows too, without needing a separate cap in each job - for a cheap,
+# fast smoke test of the whole Step Functions chain where nobody's
+# actually checking the data itself, just that every stage ran correctly.
+# Unset it (or set back to 0) before a real/graded run.
+# TESTING-ONLY - remove this env var (and its call site in job_2) before final deployment.
+MAX_ROWS_TO_INGEST = _env_int("HDB_MAX_ROWS", 0)
+
 # --------------------------------------------------------------------------- #
 # Data quality / transformation rules (job_3, job_4, job_5)
 # --------------------------------------------------------------------------- #
@@ -171,6 +277,15 @@ NATURAL_KEY_COLUMNS = _env_list(
     ["month", "town", "flat_type", "block", "street_name",
      "storey_range", "floor_area_sqm", "flat_model", "lease_commence_date"],
 )
+
+# Minimum occurrences for a categorical value (town/flat_type/flat_model) to
+# be considered "real" rather than a likely typo/garbage value - shared by
+# job_2b_data_profiling.py (reports which values fall under this, for
+# visibility) and job_3_cleaned_iceberg.py's validate_categorical() (which
+# actually rejects them). Single source of truth so profiling and
+# validation can never quietly disagree about what counts as "rare". See
+# job_3's validate_categorical() docstring for the full rationale.
+MIN_CATEGORY_FREQUENCY = _env_int("HDB_MIN_CATEGORY_FREQUENCY", 5)
 
 # Which attribute columns count as "a change" for SCD2 versioning in job_5
 ATTRIBUTE_COLUMNS_FOR_CHANGE_DETECTION = _env_list(
@@ -203,7 +318,7 @@ LOOKBACK_WINDOW_DAYS = _env_int("HDB_LOOKBACK_WINDOW_DAYS", 7)
 # get_account_id(), which resolves the live account id via STS on every
 # run. SNS_TOPIC_NAME just has to match the real topic name setup.sh
 # creates - it carries no account/region info itself.
-SNS_TOPIC_NAME = _env("HDB_SNS_TOPIC_NAME", "hdb-eventdriven-notifications")
+SNS_TOPIC_NAME = _env("HDB_SNS_TOPIC_NAME", _DEFAULT_SNS_TOPIC_NAME)
 
 # Optional escape hatch: a full ARN here overrides the dynamically-built one
 # entirely - e.g. publishing to a topic in a DIFFERENT account/region than
@@ -211,5 +326,18 @@ SNS_TOPIC_NAME = _env("HDB_SNS_TOPIC_NAME", "hdb-eventdriven-notifications")
 # send_alert() build the ARN fresh from this run's own live identity.
 SNS_TOPIC_ARN_OVERRIDE = os.environ.get("HDB_SNS_TOPIC_ARN")
 
-SES_SENDER_EMAIL = _env("HDB_SES_SENDER_EMAIL", "pipeline-alerts@example.com")  # must be SES-verified
-SES_RECIPIENT_EMAILS = _env_list("HDB_SES_RECIPIENT_EMAILS", ["data-team@example.com"])
+# Who actually gets emailed on success/failure - subscribed to SNS_TOPIC_NAME
+# by sns_subscription_setup.py (hdb_1/ project root).
+# Deliberately NO real email hardcoded here as a default, for the same
+# reason the AWS account id isn't hardcoded anywhere either (see
+# common.py's get_account_id()): an email address is personal data, and
+# this is a public GitHub repo. Empty by default - set HDB_ALERT_RECIPIENT_EMAILS
+# (comma-separated for more than one recipient) or pass --email directly to
+# the setup script instead.
+#
+# NOTE: SNS itself is the delivery mechanism (common.py's send_alert()
+# publishes to the topic) - subscribing an email here doesn't change how
+# alerts are SENT, it just determines who's actually listening. Publishing
+# to a topic with nobody subscribed succeeds silently - "Alert sent" in the
+# logs does NOT mean anyone received it until this is set up.
+ALERT_RECIPIENT_EMAILS = _env_list("HDB_ALERT_RECIPIENT_EMAILS", [])

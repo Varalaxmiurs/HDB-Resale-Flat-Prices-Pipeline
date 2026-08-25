@@ -29,10 +29,8 @@ import time
 import uuid
 from datetime import datetime
 
-import awswrangler as wr
 import boto3
 import pandas as pd
-from awswrangler.exceptions import QueryFailed
 
 from config import (
     ATHENA_WORKGROUP,
@@ -70,36 +68,14 @@ for _noisy_logger in ("boto3", "botocore", "urllib3", "s3transfer", "awswrangler
 # in both environments.
 _BOTO3_SESSION = boto3.Session(region_name=AWS_REGION)
 
-# Athena needs an explicit place to stage temporary/query results - without
-# this, wr.athena.to_iceberg()/start_query_execution() calls either raise
-# InvalidArgumentCombination ("Either path or workgroup path must be
-# specified...") or silently fall back to the AWS per-account/region default
-# results bucket, which has been the trigger for the recurring "Iceberg
-# cannot find the requested entity" failures throughout this project.
-# to_iceberg() takes temp_path= AND s3_output= as two DISTINCT parameters
-# (confirmed via inspect.signature()/getsource() against the installed
-# awswrangler version) - temp_path= is what its internal _validate_args()
-# checks, while s3_output= is what its internal CREATE TABLE query's own
-# ResultConfiguration uses - both must be passed together. The raw boto3
-# Athena calls in execute_athena_sql() use ResultConfiguration.OutputLocation
-# instead. 01_metadata_setup.py already does the boto3-side equivalent; this
-# was missing here, which is why record_audit() failed on a real job_1 run.
+# Athena needs an explicit place to stage query results - without this,
+# start_query_execution() calls either raise InvalidArgumentCombination
+# ("Either path or workgroup path must be specified...") or silently fall
+# back to the AWS per-account/region default results bucket, which has been
+# the trigger for recurring "cannot find the requested entity" failures
+# throughout this project. Every raw Athena call below passes this via
+# ResultConfiguration.OutputLocation explicitly.
 ATHENA_RESULTS_LOCATION = f"s3://{AUDIT_S3_BUCKET}/athena-results/"
-
-# temp_path (below) is a SEPARATE prefix from ATHENA_RESULTS_LOCATION on
-# purpose. to_iceberg() writes the dataframe to temp_path as Parquet, points
-# a temporary external table at that prefix, then MERGEs from it into the
-# real Iceberg table - which means that MERGE scans every object sitting
-# under temp_path. Every plain Athena query (including to_iceberg's own
-# CREATE TABLE / MERGE statements) also drops its result as a CSV file into
-# ATHENA_RESULTS_LOCATION. Pointing temp_path at that same prefix meant the
-# external table's scan picked up those unrelated CSV result files alongside
-# the actual staged Parquet - surfacing as
-# "HIVE_BAD_DATA: Malformed Parquet file. Expected magic number: PAR1 got: 00"
-# on a real job_1 run (record_audit() -> write_iceberg() -> to_iceberg()).
-# Keeping the two prefixes apart means query-result CSVs and Iceberg staging
-# Parquet never share a directory listing.
-ICEBERG_TEMP_LOCATION = f"s3://{AUDIT_S3_BUCKET}/athena-iceberg-temp/"
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -156,42 +132,247 @@ ICEBERG_PROPAGATION_RETRIES = 3
 ICEBERG_PROPAGATION_RETRY_DELAY_SECONDS = 8
 
 
-def _to_iceberg_with_retry(**kwargs) -> None:
+# --------------------------------------------------------------------------- #
+# Raw-SQL Iceberg writer (2026-08-24: replaces awswrangler's wr.athena.
+# to_iceberg()). AWS Glue Python Shell's sandboxed pip install has no C++
+# build toolchain (no cmake), and every awswrangler release either predates
+# to_iceberg(), requires Python >=3.10 (Python Shell only offers 3.9), or
+# pulls in a pyarrow version with no prebuilt wheel for this exact
+# environment - forcing a source build that fails every time. Rather than
+# keep chasing version pins, this writes/reads Iceberg tables with plain
+# Athena SQL via boto3 (start_query_execution/get_query_execution), which
+# only needs boto3 - already built into every Glue job, nothing to install.
+# --------------------------------------------------------------------------- #
+
+# pandas dtype -> Athena/Iceberg column type. Falls back to STRING for
+# anything not explicitly matched (safe default - every value round-trips
+# through a STRING column even if it loses native numeric/date typing).
+def _athena_type_for_series(series: pd.Series) -> str:
+    # Athena's Iceberg CREATE TABLE column types are Athena/Iceberg-specific,
+    # NOT plain Trino types - per AWS's own docs (Creating Iceberg Tables in
+    # Athena): "Use standard SQL types like string, int, bigint (not VARCHAR
+    # or LONG)". VARCHAR was tried here and failed for real (2026-08-24,
+    # "no viable alternative at input" right at the first column) - STRING
+    # is correct; only the surrounding CREATE TABLE clause itself needed to
+    # move from Hive-style LOCATION/TBLPROPERTIES to WITH (...) - see
+    # _create_iceberg_table_sql's note.
+    if pd.api.types.is_bool_dtype(series):
+        return "BOOLEAN"
+    if pd.api.types.is_integer_dtype(series):
+        return "BIGINT"
+    if pd.api.types.is_float_dtype(series):
+        return "DOUBLE"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMP"
+    return "STRING"
+
+
+def _sql_literal(value, athena_type: str) -> str:
+    """One Python value -> its Athena SQL literal, typed per athena_type.
+    NULL for anything pandas considers missing (None/NaN/NaT/pd.NA)."""
+    try:
+        is_missing = value is None or pd.isna(value)
+    except (TypeError, ValueError):
+        is_missing = False  # pd.isna() on e.g. a list/array raises - treat as present
+    if is_missing:
+        return "NULL"
+
+    if athena_type == "BOOLEAN":
+        return "true" if value else "false"
+    if athena_type == "TIMESTAMP":
+        ts = pd.Timestamp(value)
+        return f"TIMESTAMP '{ts.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}'"
+    if athena_type in ("BIGINT", "DOUBLE"):
+        return str(value)
+    # STRING - '' doubled is Trino/Athena's own escape for a literal quote
+    escaped = str(value).replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _create_iceberg_table_sql(table: str, location: str, df: pd.DataFrame) -> str:
+    # Real-run history for this DDL, 2026-08-24 (each confirmed via the
+    # ATHENA_SQL_DEBUG dump against the actual query text, not a guess):
+    #   1. Quoted column names + LOCATION/TBLPROPERTIES -> "mismatched input
+    #      'LOCATION'. Expecting: 'COMMENT', 'WITH', <EOF>" - misleading:
+    #      ANTLR's error recovery misattributed a much-earlier real failure
+    #      (quoted column names, see #3) to this far-later token.
+    #   2. Quoted column names + WITH (...) -> "no viable alternative at
+    #      input" landing exactly on the column names' opening quote
+    #      (confirmed by counting characters against the real dumped SQL).
+    #   3. Unquoted column names + WITH (...) -> parses the ENTIRE column
+    #      list fine, then fails exactly at "WITH (" itself - WITH (...) is
+    #      apparently only valid on CTAS (CREATE TABLE ... WITH (...) AS
+    #      SELECT ...), not a plain CREATE TABLE with explicit columns.
+    #   4. Unquoted column names + LOCATION/TBLPROPERTIES (this version) -
+    #      matches both a working reference pipeline and this account's own
+    #      Athena-reconstructed DDL for an existing table - the two real,
+    #      external confirmations we have that this exact form works.
+    # None of this pipeline's column names are reserved words or contain
+    # special characters, so leaving them unquoted is safe here - a known
+    # limitation (not a fully general quoting solution) accepted for the
+    # POC deadline.
+    col_types = {c: _athena_type_for_series(df[c]) for c in df.columns}
+    cols_sql = ",\n    ".join(f'{c} {t}' for c, t in col_types.items())
+    return f"""
+    CREATE TABLE IF NOT EXISTS {GLUE_DATABASE}.{table} (
+        {cols_sql}
+    )
+    LOCATION '{location}'
+    TBLPROPERTIES (
+        'table_type' = 'ICEBERG',
+        'format' = 'parquet',
+        'write_compression' = 'snappy'
+    )
     """
-    IMPORTANT - retrying to_iceberg() is NOT automatically safe for EITHER
+
+
+# Athena's query text is capped at 262144 bytes. Inserting all rows in one
+# statement risks hitting that on wider/larger dataframes, so rows go in
+# batches instead.
+#
+# SUPERSEDED (2026-08-25): a FIXED row-count batch size (was 500, tuned
+# 2026-08-25 for hashed_iceberg's widest rows) leaves huge headroom unused
+# for narrower tables. raw_iceberg's rows are much narrower than
+# hashed_iceberg's (no SHA-256 hashes/timestamps), so 500 rows/batch there
+# was only using a fraction of the 262144-byte limit per query - meaning
+# far MORE Athena round-trips than necessary. Each round-trip (a full
+# start_query_execution + poll loop) has real fixed latency regardless of
+# how little data is in the batch - confirmed live: a ~900K-row raw_iceberg
+# write at 500 rows/batch (~1,800 round-trips) took ~96 minutes, dominated
+# by that per-query overhead, not by row count.
+#
+# Fixed by packing each batch dynamically BY ACTUAL BYTE SIZE instead of a
+# fixed row count - narrow tables (raw/cleaned/transformed) now get far
+# bigger batches (fewer, larger round-trips) automatically, while wide
+# tables (hashed) still stay safely under the 262144-byte limit, with no
+# per-stage tuning needed.
+ICEBERG_INSERT_MAX_PAYLOAD_BYTES = 230_000  # ~88% of the 262144-byte limit, headroom for the INSERT INTO/column-list prefix
+
+
+def _insert_iceberg_rows(table: str, df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    col_types = {c: _athena_type_for_series(df[c]) for c in df.columns}
+    # Bare (unquoted) column names, matching _create_iceberg_table_sql's note
+    # above - quoting them fails for real against this workgroup's engine v3.
+    cols_sql = ", ".join(df.columns)
+    prefix = f"INSERT INTO {GLUE_DATABASE}.{table} ({cols_sql}) VALUES\n"
+    max_values_bytes = ICEBERG_INSERT_MAX_PAYLOAD_BYTES - len(prefix.encode("utf-8"))
+
+    # Build each row's literal SQL once up front - lets batches be packed by
+    # real byte size below instead of a guessed row count.
+    row_strings = []
+    for _, row in df.iterrows():
+        vals = ", ".join(_sql_literal(row[c], col_types[c]) for c in df.columns)
+        row_strings.append(f"({vals})")
+
+    batches = []
+    current, current_bytes = [], 0
+    for row_str in row_strings:
+        row_bytes = len(row_str.encode("utf-8")) + 2  # +2 for the ",\n" joiner
+        if current and current_bytes + row_bytes > max_values_bytes:
+            batches.append(current)
+            current, current_bytes = [], 0
+        current.append(row_str)
+        current_bytes += row_bytes
+    if current:
+        batches.append(current)
+
+    n_batches = len(batches)
+    for i, batch_rows in enumerate(batches):
+        values_sql = ",\n".join(batch_rows)
+        sql = f"{prefix}{values_sql}"
+        execute_athena_sql(
+            sql, f"INSERT batch {i + 1}/{n_batches} into {table} ({len(batch_rows)} row(s))"
+        )
+
+
+def _existing_iceberg_columns(table: str):
+    """Lowercase column names Glue's catalog currently has for `table`, or
+    None if the table doesn't exist yet. A plain Glue get_table() catalog
+    lookup - same rationale as _iceberg_table_exists() above (no Athena
+    round-trip / re-validation needed just to read a schema)."""
+    glue = _BOTO3_SESSION.client("glue")
+    try:
+        tbl = glue.get_table(DatabaseName=GLUE_DATABASE, Name=table)["Table"]
+    except glue.exceptions.EntityNotFoundException:
+        return None
+    return {c["Name"].lower() for c in tbl["StorageDescriptor"]["Columns"]}
+
+
+def _ensure_iceberg_columns(table: str, df: pd.DataFrame) -> None:
+    """Lightweight schema evolution: ALTER TABLE ADD COLUMNS for any df
+    column not already present on the target table. Needed for append-only
+    history tables (failed_iceberg, audit_iceberg, hashed_iceberg) that can
+    receive a wider column set than whatever schema first created them -
+    either an earlier day's test run, or an earlier write_iceberg() call
+    within the SAME job run tagging a narrower set of columns onto
+    rejected/audited rows. CREATE TABLE IF NOT EXISTS is a no-op against an
+    already-existing table, so it can never fix this on its own - confirmed
+    needed for real, 2026-08-24 (job_3's route_to_failed():
+    COLUMN_NOT_FOUND on remaining_lease_years against an already-existing
+    failed_iceberg).
+
+    Syntax note: this is Athena's own Iceberg-specific ALTER TABLE grammar,
+    NOT generic Trino ("ADD COLUMN" singular, no parens) - Athena's docs
+    (querying-iceberg-alter-table-add-columns.html) confirm the real form is
+    plural "ADD COLUMNS (col type, ...)" with parens, batching every missing
+    column into one statement. Generic Trino singular syntax was tried here
+    first and failed for real: "no viable alternative at input '...ADD
+    COLUMN'" (2026-08-24) - same pattern as CREATE TABLE needing Athena's
+    own LOCATION/TBLPROPERTIES form instead of generic Trino WITH (...)."""
+    existing = _existing_iceberg_columns(table)
+    if existing is None:
+        return  # table doesn't exist yet - the CREATE TABLE above already covers every df column
+    col_types = {c: _athena_type_for_series(df[c]) for c in df.columns}
+    missing = [(c, t) for c, t in col_types.items() if c.lower() not in existing]
+    if not missing:
+        return
+    cols_sql = ", ".join(f"{c} {t}" for c, t in missing)
+    execute_athena_sql(
+        f"ALTER TABLE {GLUE_DATABASE}.{table} ADD COLUMNS ({cols_sql})",
+        f"ALTER TABLE {table} ADD COLUMNS ({cols_sql})",
+    )
+
+
+def _write_df_iceberg_raw(df: pd.DataFrame, table: str, location: str, mode: str) -> None:
+    """CREATE (if needed) + evolve schema (if needed) + INSERT - the raw-SQL
+    equivalent of wr.athena.to_iceberg(df, mode=..., schema_evolution=True).
+    mode="overwrite" assumes the caller (overwrite_iceberg()) already
+    dropped any existing table, so this only ever CREATEs fresh + INSERTs;
+    mode="append" CREATEs the table on a first run exactly like to_iceberg()
+    did, or evolves + INSERTs into an existing one.
+    """
+    execute_athena_sql(_create_iceberg_table_sql(table, location, df), f"CREATE TABLE IF NOT EXISTS {table}")
+    _ensure_iceberg_columns(table, df)
+    _insert_iceberg_rows(table, df)
+
+
+def _to_iceberg_with_retry(df: pd.DataFrame, table: str, location: str, mode: str) -> None:
+    """
+    IMPORTANT - retrying a write is NOT automatically safe for EITHER
     mode="append" OR mode="overwrite": the "cannot find the requested
-    entity" propagation-lag error can surface from a step INSIDE
-    to_iceberg() that runs AFTER the actual data write already committed
-    (e.g. its own post-write catalog check) - not just from the CREATE
-    TABLE step. A naive blind retry then re-runs the WHOLE call, repeating
-    whatever write already landed. This has now bitten BOTH modes on real
-    runs:
+    entity" propagation-lag error (AWS-side Glue Catalog / Iceberg metadata
+    lag right after a CREATE TABLE, not a real problem with the table) can
+    surface AFTER the actual data write already committed. A naive blind
+    retry then re-runs the WHOLE call, repeating whatever write already
+    landed. This bit BOTH modes for real with the old awswrangler-based
+    writer:
       - mode="append": raw_iceberg ended up with 1,377,021 rows instead of
         459,007 - exactly 3x (one real append + 2 duplicate retries).
       - mode="overwrite": raw_iceberg ended up with 918,014 rows instead of
-        459,007 - exactly 2x (one real write + 1 duplicate retry). Whatever
-        awswrangler does internally for a retried "overwrite" against a
-        table that was JUST created by the previous (apparently-failed)
-        attempt, it evidently does NOT cleanly replace that data - it adds
-        to it. So "overwrite" is not inherently retry-safe either, despite
-        being logically idempotent when it runs exactly once.
+        459,007 - exactly 2x (one real write + 1 duplicate retry).
 
-    Fixed the same way for both: snapshot the target table's row count
-    before the attempt, and - only on the propagation-lag error - check
-    whether the row count already reflects a successful write of THIS call
-    before deciding to retry:
+    Fixed the same way here: snapshot the target table's row count before
+    the attempt, and - only on the propagation-lag error - check whether
+    the row count already reflects a successful write of THIS call before
+    deciding to retry:
       - append  -> safe if after_count >= before_count + expected_new_rows
-                   (the new rows are already there, on top of what existed)
-      - overwrite -> safe if after_count == expected_new_rows (the table
-                   now holds EXACTLY the new snapshot, matching what a
-                   single successful overwrite should produce)
+      - overwrite -> safe if after_count == expected_new_rows
     If the count doesn't match either shape, the write genuinely didn't
     land as expected and it's retried as before.
     """
     logger = get_logger("to_iceberg_retry")
-    mode = kwargs.get("mode")
-    table = kwargs.get("table")
-    df = kwargs.get("df")
     expected_new_rows = len(df) if df is not None else None
 
     before_count = None
@@ -200,9 +381,9 @@ def _to_iceberg_with_retry(**kwargs) -> None:
 
     for attempt in range(1, ICEBERG_PROPAGATION_RETRIES + 1):
         try:
-            wr.athena.to_iceberg(**kwargs)
+            _write_df_iceberg_raw(df, table, location, mode)
             return
-        except QueryFailed as exc:
+        except RuntimeError as exc:
             if "cannot find the requested entity" not in str(exc).lower():
                 raise  # a different failure - don't mask it, fail immediately
 
@@ -278,19 +459,7 @@ def write_iceberg(df: pd.DataFrame, stage: str, mode: str = "append") -> None:
     if df is None or df.empty:
         return
     table, location = TABLES[stage]
-    _to_iceberg_with_retry(
-        df=df,
-        database=GLUE_DATABASE,
-        table=table,
-        table_location=location,
-        keep_files=False,
-        mode=mode,
-        schema_evolution=True,
-        temp_path=ICEBERG_TEMP_LOCATION,
-        s3_output=ATHENA_RESULTS_LOCATION,
-        workgroup=ATHENA_WORKGROUP,
-        boto3_session=_BOTO3_SESSION,
-    )
+    _to_iceberg_with_retry(df=df, table=table, location=location, mode=mode)
 
 
 def execute_athena_sql(sql: str, description: str) -> None:
@@ -302,7 +471,22 @@ def execute_athena_sql(sql: str, description: str) -> None:
     """
     athena = _BOTO3_SESSION.client("athena")
     logger = get_logger("athena_sql")
-    logger.info("Athena SQL: %s", description)
+    # print(), not logger.info(): Glue's Python Shell runtime pre-configures
+    # the root logger before this script runs, which makes this module's
+    # logging.basicConfig() a no-op (Python's basicConfig() silently does
+    # nothing if the root logger already has handlers) - so every log line
+    # in this file goes out via print(), which always reaches stdout/
+    # CloudWatch regardless of logging config.
+    #
+    # CLEANUP (2026-08-25): this used to also dump the full SQL text on
+    # every single call (temporary aid while root-causing several real
+    # Iceberg DDL syntax errors on 2026-08-24 - see
+    # _create_iceberg_table_sql()'s docstring for that history). All of
+    # those are resolved now, so the per-query full-text dump was removed -
+    # it was pure noise for every one of the dozens of queries a real run
+    # issues. If a query ever needs to be diagnosed again, temporarily add
+    # `print(sql)` back in right here rather than leaving it on permanently.
+    print(f"Athena SQL: {description}")
 
     query_id = athena.start_query_execution(
         QueryString=sql,
@@ -322,6 +506,32 @@ def execute_athena_sql(sql: str, description: str) -> None:
             )
             raise RuntimeError(f"Athena SQL failed ({description}): {reason}")
         time.sleep(2)
+
+
+def read_csv_files_from_s3(bucket: str, prefix: str) -> pd.DataFrame:
+    """Read and concatenate every .csv object under an S3 prefix into one
+    dataframe - the raw-boto3 equivalent of wr.s3.read_csv(path=...,
+    path_suffix=".csv", dataset=False) (removed 2026-08-24, same reason as
+    the Iceberg reader/writer above - see _to_iceberg_with_retry()'s
+    docstring).
+
+    NOTE (2026-08-25): source files are left in place after being read - no
+    archiving to a separate bucket (removed per request). Rerunning against
+    the same source files simply reprocesses them, which is safe since
+    raw_iceberg is a full overwrite every run anyway."""
+    s3 = _BOTO3_SESSION.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    frames = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".csv"):
+                continue
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"]
+            frames.append(pd.read_csv(body))
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 def _iceberg_row_count(table: str) -> int:
@@ -493,18 +703,7 @@ def merge_iceberg(df: pd.DataFrame, stage: str, key_column: str = "surrogate_key
     if not _iceberg_table_exists(table):
         print(f"{table} BEFORE: table does not exist yet (0 rows)")
         logger.info("%s doesn't exist yet - writing initial data directly (no MERGE needed on a first run)", table)
-        _to_iceberg_with_retry(
-            df=df,
-            database=GLUE_DATABASE,
-            table=table,
-            table_location=location,
-            keep_files=False,
-            mode="append",
-            temp_path=ICEBERG_TEMP_LOCATION,
-            s3_output=ATHENA_RESULTS_LOCATION,
-            workgroup=ATHENA_WORKGROUP,
-            boto3_session=_BOTO3_SESSION,
-        )
+        _to_iceberg_with_retry(df=df, table=table, location=location, mode="append")
         print(f"{table} AFTER:  {_iceberg_row_count(table)} row(s) (initial write, no merge)")
         return
 
@@ -512,17 +711,8 @@ def merge_iceberg(df: pd.DataFrame, stage: str, key_column: str = "surrogate_key
     print(f"{table} BEFORE merge: {before_count} row(s)")
 
     _to_iceberg_with_retry(
-        df=df,
-        database=GLUE_DATABASE,
-        table=staging_table,
-        table_location=staging_location,
-        keep_files=True,
-        mode="overwrite",  # staging table only ever holds this run's batch
-        temp_path=ICEBERG_TEMP_LOCATION,
-        s3_output=ATHENA_RESULTS_LOCATION,
-        workgroup=ATHENA_WORKGROUP,
-        boto3_session=_BOTO3_SESSION,
-    )
+        df=df, table=staging_table, location=staging_location, mode="overwrite"
+    )  # staging table only ever holds this run's batch
 
     all_cols = [c for c in df.columns if c != key_column]
     # Trino/Athena's MERGE ... WHEN MATCHED THEN UPDATE SET grammar wants
@@ -634,18 +824,7 @@ def overwrite_iceberg(df: pd.DataFrame, stage: str) -> None:
         logger.info("Dropping %s (Glue table + S3 data) before full reload, so its schema always matches this run's dataframe exactly", table)
         _drop_iceberg_table(table, location)
 
-    _to_iceberg_with_retry(
-        df=df,
-        database=GLUE_DATABASE,
-        table=table,
-        table_location=location,
-        keep_files=False,
-        mode="overwrite",
-        temp_path=ICEBERG_TEMP_LOCATION,
-        s3_output=ATHENA_RESULTS_LOCATION,
-        workgroup=ATHENA_WORKGROUP,
-        boto3_session=_BOTO3_SESSION,
-    )
+    _to_iceberg_with_retry(df=df, table=table, location=location, mode="overwrite")
 
     after_count = _iceberg_row_count(table)
     print(f"{table} AFTER:  {after_count} row(s) (full reload, was {before_count})")
@@ -654,38 +833,78 @@ def overwrite_iceberg(df: pd.DataFrame, stage: str) -> None:
 def read_iceberg(stage: str) -> pd.DataFrame:
     """Read the full contents of a stage's Iceberg table via Athena."""
     table, _ = TABLES[stage]
-    return wr.athena.read_sql_query(
-        sql=f'SELECT * FROM "{table}"',
-        database=GLUE_DATABASE,
-        ctas_approach=False,
-        s3_output=ATHENA_RESULTS_LOCATION,
-        workgroup=ATHENA_WORKGROUP,
-        boto3_session=_BOTO3_SESSION,
-    )
+    return athena_read_sql(f'SELECT * FROM "{table}"')
+
+
+# Athena's Trino result type name -> the pandas conversion to apply. Any
+# type not listed here (STRING, and anything unusual) is left as the raw
+# text get_query_results returns - a safe fallback, never a crash.
+_ATHENA_TYPE_TO_PANDAS = {
+    "integer": "int", "bigint": "int", "smallint": "int", "tinyint": "int",
+    "double": "float", "float": "float", "real": "float", "decimal": "float",
+    "boolean": "bool",
+    "timestamp": "datetime", "date": "datetime",
+}
 
 
 def athena_read_sql(sql: str) -> pd.DataFrame:
     """Run an arbitrary SELECT via Athena and return it as a dataframe - the
-    same s3_output/workgroup/boto3_session wiring read_iceberg() uses, for
-    callers that need a query read_iceberg()'s "SELECT * FROM one whole
-    stage table" shape doesn't cover (e.g. job_5's read_current_versions(),
-    which filters to WHERE is_current = true instead of reading everything).
+    raw-boto3 equivalent of wr.athena.read_sql_query() (removed 2026-08-24,
+    see _to_iceberg_with_retry()'s docstring for why). Used both by
+    read_iceberg() above and by callers that need a query read_iceberg()'s
+    "SELECT * FROM one whole stage table" shape doesn't cover (e.g. job_5's
+    read_current_versions(), which filters to WHERE is_current = true).
 
-    Added after a real run showed awswrangler's own warning - "No s3_output
-    was provided... falling back to the default bucket" - from a query that
-    had been calling wr.athena.read_sql_query() directly without this
-    wiring. Functionally harmless (falls back to a usable default bucket),
-    but inconsistent with every other Athena call in this file, which all
-    point at ATHENA_RESULTS_LOCATION - hence this shared helper instead of
-    every caller repeating (or forgetting) the same 3 keyword arguments."""
-    return wr.athena.read_sql_query(
-        sql=sql,
-        database=GLUE_DATABASE,
-        ctas_approach=False,
-        s3_output=ATHENA_RESULTS_LOCATION,
-        workgroup=ATHENA_WORKGROUP,
-        boto3_session=_BOTO3_SESSION,
-    )
+    get_query_results() returns every cell as plain text (VarCharValue) -
+    this re-applies real types per-column afterward using Athena's own
+    reported column types, so callers still get workable int/float/bool/
+    datetime dtypes instead of an all-string dataframe."""
+    athena = _BOTO3_SESSION.client("athena")
+    query_id = athena.start_query_execution(
+        QueryString=sql,
+        QueryExecutionContext={"Database": GLUE_DATABASE},
+        WorkGroup=ATHENA_WORKGROUP,
+        ResultConfiguration={"OutputLocation": ATHENA_RESULTS_LOCATION},
+    )["QueryExecutionId"]
+
+    while True:
+        state = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]["State"]
+        if state == "SUCCEEDED":
+            break
+        if state in ("FAILED", "CANCELLED"):
+            reason = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"].get(
+                "StateChangeReason", "Unknown error"
+            )
+            raise RuntimeError(f"Athena SELECT failed: {reason}")
+        time.sleep(2)
+
+    columns = None
+    col_types = None
+    data_rows = []
+    paginator = athena.get_paginator("get_query_results")
+    for page_num, page in enumerate(paginator.paginate(QueryExecutionId=query_id)):
+        result_set = page["ResultSet"]
+        if columns is None:
+            column_info = result_set["ResultSetMetadata"]["ColumnInfo"]
+            columns = [c["Name"] for c in column_info]
+            col_types = [c["Type"] for c in column_info]
+        rows = result_set["Rows"]
+        start = 1 if page_num == 0 else 0  # row 0 of the FIRST page only is the header
+        for row in rows[start:]:
+            data_rows.append([cell.get("VarCharValue") for cell in row["Data"]])
+
+    df = pd.DataFrame(data_rows, columns=columns or [])
+    for col, athena_type in zip(columns or [], col_types or []):
+        kind = _ATHENA_TYPE_TO_PANDAS.get(athena_type)
+        if kind == "int":
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+        elif kind == "float":
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif kind == "bool":
+            df[col] = df[col].map({"true": True, "false": False})
+        elif kind == "datetime":
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
 
 
 def route_to_failed(df: pd.DataFrame, reason: str, stage: str) -> None:
@@ -709,6 +928,15 @@ def record_audit(job_name: str, stage: str, rows_in: int, rows_out: int, rows_re
     rows came in, how many passed, how many were rejected. This is the
     traceability trail referenced by AUDIT_S3_BUCKET - separate
     from failed_iceberg, which holds the actual rejected records themselves.
+
+    FAIL-SOFT: this is a logging nicety, not the job's actual output -
+    raw/cleaned/transformed/hashed_iceberg (written via write_iceberg()
+    elsewhere) are the real deliverable and DO still raise on failure.
+    write_iceberg() itself no longer depends on awswrangler (rewritten to
+    raw Athena SQL, 2026-08-24 - see _to_iceberg_with_retry()'s docstring),
+    so this should rarely trip now; kept as a safety net so a genuine
+    Athena/audit-table hiccup still can't take down an otherwise-successful
+    job run over what is, after all, just its own audit trail.
     """
     audit_row = pd.DataFrame([{
         "run_id": str(uuid.uuid4()),
@@ -719,7 +947,12 @@ def record_audit(job_name: str, stage: str, rows_in: int, rows_out: int, rows_re
         "rows_rejected": rows_rejected,
         "run_timestamp": datetime.utcnow().isoformat(),
     }])
-    write_iceberg(audit_row, stage="audit", mode="append")
+    try:
+        write_iceberg(audit_row, stage="audit", mode="append")
+    except Exception as exc:
+        get_logger("record_audit").warning(
+            "record_audit() failed to write audit_iceberg (non-fatal, job continues): %s", exc
+        )
 
 
 # --------------------------------------------------------------------------- #

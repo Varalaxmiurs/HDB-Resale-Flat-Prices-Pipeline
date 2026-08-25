@@ -32,7 +32,7 @@ import os
 import sys
 from pathlib import Path
 
-# This script sits at the hdb_1/ project root, while config.py / common.py /
+# This script sits at the project root, while config.py / common.py /
 # orchestration.py / job_*.py live in pipeline-scripts/05_ETL/ - add that
 # folder to sys.path so they can be imported directly, same as the notebook.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "pipeline-scripts" / "05_ETL"))

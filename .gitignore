@@ -4,3 +4,6 @@ __pycache__/
 lambda_function.zip
 trust-policy.json
 github-actions-s3-policy.json
+_to_delete/
+.venv/
+.env

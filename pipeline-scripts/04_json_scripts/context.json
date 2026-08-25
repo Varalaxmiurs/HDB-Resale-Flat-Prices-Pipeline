@@ -1,7 +1,7 @@
 {
   "action": "read",
   "database": "hdb_eventdriven_database",
-  "generated_at": "2026-08-24T10:36:45.233518+00:00",
+  "generated_at": "2026-08-24T17:28:41.605167+00:00",
   "tables": {
     "metadata_tables": [
       {
@@ -17,7 +17,7 @@
         "gold_schema": "hashed_iceberg",
         "active_flag": "true",
         "load_order": "1",
-        "created_at": "2026-08-24 08:15:23.472000"
+        "created_at": "2026-08-24 14:58:22.871000"
       }
     ],
     "table_parameters": [
@@ -25,237 +25,83 @@
         "table_id": "1",
         "parameter_name": "load_type",
         "parameter_value": "FULL",
-        "created_at": "2026-08-24 08:15:05.246000"
+        "created_at": "2026-08-24 14:58:07.162000"
       },
       {
         "table_id": "1",
         "parameter_name": "primary_key",
         "parameter_value": "month,town,flat_type,block,street_name,storey_range,floor_area_sqm,flat_model,lease_commence_date",
-        "created_at": "2026-08-24 08:15:05.246000"
+        "created_at": "2026-08-24 14:58:07.162000"
+      },
+      {
+        "table_id": "1",
+        "parameter_name": "lookback_window",
+        "parameter_value": "7",
+        "created_at": "2026-08-24 14:58:07.162000"
       }
     ],
     "table_watermarks": [
       {
         "table_id": "1",
-        "last_watermark_value": "2026-08-24T09:14:11.596669",
-        "last_updated_at": "2026-08-24 09:14:13.641000",
-        "last_run_id": "18"
+        "last_watermark_value": "1900-01-01 00:00:00",
+        "last_updated_at": "2026-08-24 14:58:15.075000",
+        "last_run_id": null
       },
       {
         "table_id": "6",
         "last_watermark_value": "1900-01-01 00:00:00",
-        "last_updated_at": "2026-08-23 20:42:31.979000",
+        "last_updated_at": "2026-08-24 14:58:15.075000",
         "last_run_id": null
       },
       {
         "table_id": "3",
         "last_watermark_value": "1900-01-01 00:00:00",
-        "last_updated_at": "2026-08-23 20:42:31.979000",
+        "last_updated_at": "2026-08-24 14:58:15.075000",
         "last_run_id": null
       },
       {
         "table_id": "5",
         "last_watermark_value": "1900-01-01 00:00:00",
-        "last_updated_at": "2026-08-23 20:42:31.979000",
+        "last_updated_at": "2026-08-24 14:58:15.075000",
         "last_run_id": null
       },
       {
         "table_id": "2",
         "last_watermark_value": "1900-01-01 00:00:00",
-        "last_updated_at": "2026-08-23 20:42:31.979000",
+        "last_updated_at": "2026-08-24 14:58:15.075000",
         "last_run_id": null
       }
     ],
     "pipeline_runs": [
       {
-        "run_id": "4",
+        "run_id": "1",
         "table_id": "1",
-        "layer": "data_profiling",
-        "start_time": "2026-08-24 07:26:28.960952",
-        "end_time": "2026-08-24 07:27:51.240122",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "17",
-        "table_id": "1",
-        "layer": "hashed_iceberg",
-        "start_time": "2026-08-24 09:07:31.171813",
-        "end_time": "2026-08-24 09:08:55.810920",
+        "layer": "pipeline",
+        "start_time": "2026-08-24 15:19:41.672280",
+        "end_time": "2026-08-24 15:19:53.956984",
         "status": "FAILED",
         "number_of_records": "0",
-        "error_message": "Impossible to infer the equivalent Athena data type for the effective_end_date column. It is completely empty (only null values) and has a too generic data type (object). Please, cast this columns with a more deterministic data type (e.g. df['effective_end_date'] = df['effective_end_date'].astype('string')) or pass the column schema as argument(e.g. dtype={'effective_end_date': 'string'}"
+        "error_message": "Failed at step 'ingestion_to_source': 429 Client Error: Too Many Requests for url: https://api-open.data.gov.sg/v1/public/api/datasets/d_2d5ff9ea31397b66239f245f57751537/initiate-download"
       },
       {
-        "run_id": "15",
+        "run_id": "2",
         "table_id": "1",
-        "layer": "cleaned_iceberg",
-        "start_time": "2026-08-24 08:43:47.691421",
-        "end_time": "2026-08-24 08:47:40.730498",
+        "layer": "pipeline",
+        "start_time": "2026-08-24 15:41:36.318075",
+        "end_time": "2026-08-24 15:50:52.736910",
         "status": "SUCCEEDED",
-        "number_of_records": "0",
+        "number_of_records": "3",
         "error_message": null
       },
       {
         "run_id": "3",
         "table_id": "1",
-        "layer": "raw_iceberg",
-        "start_time": "2026-08-24 07:25:10.003955",
-        "end_time": "2026-08-24 07:26:03.976700",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "1",
-        "table_id": "1",
-        "layer": "raw_iceberg",
-        "start_time": "2026-08-24 07:03:08.338401",
-        "end_time": "2026-08-24 07:03:55.768816",
-        "status": "FAILED",
-        "number_of_records": "0",
-        "error_message": "An error occurred (InvalidRequestException) when calling the StartQueryExecution operation: line 4:35: mismatched input '.'. Expecting: '='"
-      },
-      {
-        "run_id": "16",
-        "table_id": "1",
-        "layer": "transformed_iceberg",
-        "start_time": "2026-08-24 08:51:59.591198",
-        "end_time": "2026-08-24 08:53:32.446497",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "2",
-        "table_id": "1",
-        "layer": "raw_iceberg",
-        "start_time": "2026-08-24 07:10:34.448802",
-        "end_time": "2026-08-24 07:11:18.473367",
-        "status": "FAILED",
-        "number_of_records": "0",
-        "error_message": "Athena SQL failed (Idempotent upsert into raw_iceberg (459007 rows) via raw_iceberg_staging): Table raw_iceberg not found in database hdb_eventdriven_database"
-      },
-      {
-        "run_id": "13",
-        "table_id": "1",
-        "layer": "data_profiling",
-        "start_time": "2026-08-24 08:35:41.054781",
-        "end_time": "2026-08-24 08:36:53.417893",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "7",
-        "table_id": "1",
-        "layer": "raw_iceberg",
-        "start_time": "2026-08-24 07:51:07.243463",
-        "end_time": "2026-08-24 07:52:12.126184",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "11",
-        "table_id": "1",
-        "layer": "cleaned_iceberg",
-        "start_time": "2026-08-24 08:20:05.389819",
-        "end_time": "2026-08-24 08:23:27.874046",
-        "status": "FAILED",
-        "number_of_records": "0",
-        "error_message": "Schema change detected: {'new_columns': {'remaining_lease_months': 'bigint', 'remaining_lease_years': 'bigint'}, 'modified_columns': {}, 'missing_columns': {}}"
-      },
-      {
-        "run_id": "10",
-        "table_id": "1",
-        "layer": "data_profiling",
-        "start_time": "2026-08-24 08:18:05.119642",
-        "end_time": "2026-08-24 08:19:42.632137",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "6",
-        "table_id": "1",
-        "layer": "raw_iceberg",
-        "start_time": "2026-08-24 07:35:52.250124",
-        "end_time": "2026-08-24 07:37:01.884494",
-        "status": "FAILED",
-        "number_of_records": "0",
-        "error_message": "Athena SQL failed (Idempotent upsert into raw_iceberg (459007 rows) via raw_iceberg_staging): MERGE_TARGET_ROW_MULTIPLE_MATCHES: One MERGE target table row matched more than one source row"
-      },
-      {
-        "run_id": "19",
-        "table_id": "1",
         "layer": "pipeline",
-        "start_time": "2026-08-24 10:27:57.928909",
-        "end_time": "2026-08-24 10:36:10.979776",
+        "start_time": "2026-08-24 17:17:26.101012",
+        "end_time": "2026-08-24 17:28:18.901498",
         "status": "SUCCEEDED",
-        "number_of_records": "0",
+        "number_of_records": "1",
         "error_message": null
-      },
-      {
-        "run_id": "5",
-        "table_id": "1",
-        "layer": "cleaned_iceberg",
-        "start_time": "2026-08-24 07:28:12.972603",
-        "end_time": "2026-08-24 07:32:32.636499",
-        "status": "FAILED",
-        "number_of_records": "0",
-        "error_message": "Schema change detected: {'new_columns': {'remaining_lease_months': 'bigint', 'remaining_lease_years': 'bigint'}, 'modified_columns': {}, 'missing_columns': {}}"
-      },
-      {
-        "run_id": "8",
-        "table_id": "1",
-        "layer": "data_profiling",
-        "start_time": "2026-08-24 07:52:40.093565",
-        "end_time": "2026-08-24 07:54:14.131835",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "18",
-        "table_id": "1",
-        "layer": "hashed_iceberg",
-        "start_time": "2026-08-24 09:12:21.383441",
-        "end_time": "2026-08-24 09:14:11.596669",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "9",
-        "table_id": "1",
-        "layer": "raw_iceberg",
-        "start_time": "2026-08-24 08:16:00.242901",
-        "end_time": "2026-08-24 08:17:38.544637",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "12",
-        "table_id": "1",
-        "layer": "raw_iceberg",
-        "start_time": "2026-08-24 08:33:48.546987",
-        "end_time": "2026-08-24 08:35:16.241209",
-        "status": "SUCCEEDED",
-        "number_of_records": "0",
-        "error_message": null
-      },
-      {
-        "run_id": "14",
-        "table_id": "1",
-        "layer": "cleaned_iceberg",
-        "start_time": "2026-08-24 08:37:19.240027",
-        "end_time": "2026-08-24 08:39:52.543158",
-        "status": "FAILED",
-        "number_of_records": "0",
-        "error_message": "Schema change detected: {'new_columns': {'remaining_lease_years': 'bigint', 'remaining_lease_months': 'bigint'}, 'modified_columns': {}, 'missing_columns': {}}"
       }
     ]
   },

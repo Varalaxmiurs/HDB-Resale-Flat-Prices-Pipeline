@@ -17,6 +17,7 @@ this on api-open.data.gov.sg/v1 vs the v2 api-production domain used for
 collection metadata.
 """
 
+import random
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -33,9 +34,12 @@ from config import (
     DATE_RANGE_END,
     DATE_RANGE_START,
     LOOKBACK_WINDOW_DAYS,
+    MAX_API_RETRIES,
+    MAX_DATASETS_TO_INGEST,
     POLL_INTERVAL_SECONDS,
     POLL_TIMEOUT_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
+    RETRY_BACKOFF_BASE_SECONDS,
     SOURCE_S3_BUCKET,
     SOURCE_S3_PREFIX,
 )
@@ -48,6 +52,40 @@ s3_client = boto3.client("s3")
 # get_table_parameter() call already uses for this dataset (see
 # 01_metadata_setup.py's seed data).
 TARGET_TABLE_ID = 1
+
+
+def _get_with_retry(url: str, **kwargs) -> requests.Response:
+    """requests.get() with 429-aware retry - see config.py's
+    MAX_API_RETRIES/RETRY_BACKOFF_BASE_SECONDS comment for why this
+    exists. Honors the API's own Retry-After header (seconds) when
+    present; otherwise backs off exponentially (2s, 4s, 8s, ... plus a
+    little random jitter so multiple runs don't all retry in lockstep).
+    Any non-429 error still raises immediately via raise_for_status() -
+    this only smooths over the specific "too many requests too fast"
+    case, not real failures."""
+    for attempt in range(1, MAX_API_RETRIES + 1):
+        resp = requests.get(url, **kwargs)
+
+        if resp.status_code == 429 and attempt < MAX_API_RETRIES:
+            retry_after = resp.headers.get("Retry-After")
+            wait_seconds = (
+                float(retry_after) if retry_after
+                else RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            )
+            logger.warning(
+                "429 rate limited on %s (attempt %d/%d) - waiting %.1fs before retry",
+                url, attempt, MAX_API_RETRIES, wait_seconds,
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        resp.raise_for_status()
+        return resp
+
+    # Loop only exits without returning if every attempt (including the
+    # last) came back 429 - surface that as the real error.
+    resp.raise_for_status()
+    return resp
 
 
 @dataclass
@@ -64,8 +102,7 @@ def _parse_date(iso_ts: str) -> date:
 
 def get_collection_datasets(collection_id: int) -> List[DatasetRef]:
     url = f"{COLLECTION_API_BASE}/collections/{collection_id}/metadata"
-    resp = requests.get(url, params={"withDatasetMetadata": "true"}, timeout=REQUEST_TIMEOUT_SECONDS)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, params={"withDatasetMetadata": "true"}, timeout=REQUEST_TIMEOUT_SECONDS)
     payload = resp.json()
     if payload.get("errorMsg"):
         raise RuntimeError(f"Collection metadata API error: {payload['errorMsg']}")
@@ -95,8 +132,7 @@ def filter_datasets_by_range(datasets: List[DatasetRef], start: date, end: date)
 
 def initiate_download(dataset_id: str) -> None:
     url = f"{DATASET_API_BASE}/datasets/{dataset_id}/initiate-download"
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-    resp.raise_for_status()
+    resp = _get_with_retry(url, timeout=REQUEST_TIMEOUT_SECONDS)
     payload = resp.json()
     if payload.get("errorMsg"):
         raise RuntimeError(f"initiate-download error for {dataset_id}: {payload['errorMsg']}")
@@ -106,8 +142,7 @@ def poll_download(dataset_id: str) -> str:
     url = f"{DATASET_API_BASE}/datasets/{dataset_id}/poll-download"
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
-        resp.raise_for_status()
+        resp = _get_with_retry(url, timeout=REQUEST_TIMEOUT_SECONDS)
         payload = resp.json()
         if payload.get("errorMsg"):
             raise RuntimeError(f"poll-download error for {dataset_id}: {payload['errorMsg']}")
@@ -195,8 +230,25 @@ def main() -> List[str]:
     range_start, range_end = resolve_effective_date_range()
     matching = filter_datasets_by_range(datasets, range_start, range_end)
 
+    # TESTING-ONLY block - remove this whole if-block (and the
+    # MAX_DATASETS_TO_INGEST import above) before final deployment.
+    if MAX_DATASETS_TO_INGEST > 0 and len(matching) > MAX_DATASETS_TO_INGEST:
+        logger.info(
+            "HDB_MAX_DATASETS=%d - testing cap applied, ingesting %d of %d matched datasets "
+            "(dropped: %s)",
+            MAX_DATASETS_TO_INGEST, MAX_DATASETS_TO_INGEST, len(matching),
+            [d.dataset_id for d in matching[MAX_DATASETS_TO_INGEST:]],
+        )
+        matching = matching[:MAX_DATASETS_TO_INGEST]
+
     source_paths = []
-    for d in matching:
+    for i, d in enumerate(matching):
+        if i > 0:
+            # Small courtesy gap between datasets, on top of the 429
+            # retry logic above - reduces how often we hit the rate
+            # limit in the first place rather than only reacting to it
+            # after the fact.
+            time.sleep(1)
         initiate_download(d.dataset_id)
         url = poll_download(d.dataset_id)
         source_paths.append(download_to_source(d.dataset_id, url))

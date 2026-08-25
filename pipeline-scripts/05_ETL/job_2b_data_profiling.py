@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from common import get_logger, read_iceberg, record_audit
-from config import AUDIT_S3_BUCKET
+from config import AUDIT_S3_BUCKET, MIN_CATEGORY_FREQUENCY
 
 logger = get_logger("job_2b_data_profiling")
 
@@ -70,6 +70,64 @@ def _column_profile(series: pd.Series) -> dict:
     return profile
 
 
+def _storey_range_profile(df: pd.DataFrame) -> dict:
+    """Parses storey_range ('01 TO 03') into low/high ints and reports the
+    observed range plus any structurally-anomalous rows (low > high, or
+    both zero e.g. '00 TO 00') - visibility ahead of job_3's format-only
+    regex check, which only verifies the SHAPE of storey_range, not
+    whether the two numbers actually make sense together."""
+    if "storey_range" not in df.columns:
+        return {}
+    parts = df["storey_range"].astype(str).str.strip().str.extract(r"^(\d{2}) TO (\d{2})$")
+    low = pd.to_numeric(parts[0], errors="coerce")
+    high = pd.to_numeric(parts[1], errors="coerce")
+    valid_pair = low.notna() & high.notna()
+    anomalous = valid_pair & ((low > high) | ((low == 0) & (high == 0)))
+    return {
+        "min_storey": float(low[valid_pair].min()) if valid_pair.any() else None,
+        "max_storey": float(high[valid_pair].max()) if valid_pair.any() else None,
+        "unparseable_rows": int((~valid_pair).sum()),
+        "anomalous_range_rows": int(anomalous.sum()),
+    }
+
+
+def _block_format_profile(df: pd.DataFrame) -> dict:
+    """Buckets block values by shape: pure numeric ('108'), alphanumeric
+    ('406A'), or 'other' (anything else) - visibility into how consistent
+    block formatting actually is, ahead of job_4's _block_digits()
+    extraction."""
+    if "block" not in df.columns:
+        return {}
+    values = df["block"].astype(str).str.strip()
+    is_numeric = values.str.match(r"^\d+$")
+    is_alnum = values.str.match(r"^\d+[A-Za-z]+$")
+    other = ~(is_numeric | is_alnum)
+    return {
+        "numeric_count": int(is_numeric.sum()),
+        "alphanumeric_count": int(is_alnum.sum()),
+        "other_format_count": int(other.sum()),
+        "other_format_sample": sorted(values[other].unique().tolist())[:20],
+    }
+
+
+def _rare_category_profile(df: pd.DataFrame, columns: list) -> dict:
+    """Values occurring fewer than MIN_CATEGORY_FREQUENCY times in a
+    categorical column - could be a genuinely rare-but-real category
+    (e.g. an uncommon flat_model) or a transcription typo. Purely
+    informational here - job_3's validate_categorical() is what actually
+    rejects on this, using the SAME threshold (config.MIN_CATEGORY_FREQUENCY),
+    so this just makes "what's rare and why" visible to a reviewer ahead of
+    that rejection happening."""
+    rare = {}
+    for col in columns:
+        if col not in df.columns:
+            continue
+        values = df[col].astype(str).str.strip()
+        counts = values[values != ""].value_counts()
+        rare[col] = counts[counts < MIN_CATEGORY_FREQUENCY].to_dict()
+    return rare
+
+
 def profile_dataframe(df: pd.DataFrame, dataset_name: str) -> dict:
     """Produce a profiling report: shape, per-column stats, and duplicate-key
     counts, all derived from the data itself (no external whitelists)."""
@@ -86,6 +144,10 @@ def profile_dataframe(df: pd.DataFrame, dataset_name: str) -> dict:
         dup_mask = df.duplicated(subset=key_cols, keep=False)
         report["composite_key_duplicate_rows"] = int(dup_mask.sum())
 
+    report["storey_range_profile"] = _storey_range_profile(df)
+    report["block_format_profile"] = _block_format_profile(df)
+    report["rare_categories"] = _rare_category_profile(df, ["town", "flat_type", "flat_model"])
+
     return report
 
 
@@ -100,6 +162,26 @@ def render_markdown_summary(report: dict) -> str:
     if "composite_key_duplicate_rows" in report:
         lines.append(f"- Rows sharing a composite key (differ only by resale_price): "
                       f"{report['composite_key_duplicate_rows']}")
+    sp = report.get("storey_range_profile") or {}
+    if sp:
+        lines.append(
+            f"- Storey range: min={sp.get('min_storey')}, max={sp.get('max_storey')}, "
+            f"unparseable={sp.get('unparseable_rows')}, "
+            f"anomalous (low>high or 00 TO 00)={sp.get('anomalous_range_rows')}"
+        )
+    bp = report.get("block_format_profile") or {}
+    if bp:
+        lines.append(
+            f"- Block formats: numeric={bp.get('numeric_count')}, "
+            f"alphanumeric={bp.get('alphanumeric_count')}, other={bp.get('other_format_count')} "
+            f"(sample: {bp.get('other_format_sample')})"
+        )
+    rare = report.get("rare_categories") or {}
+    if any(rare.values()):
+        lines.append("- Rare categories (< MIN_CATEGORY_FREQUENCY occurrences - possible typos):")
+        for col, vals in rare.items():
+            if vals:
+                lines.append(f"  - {col}: {vals}")
     lines.append("")
     lines.append("## Per-column summary")
     for col, prof in report["columns"].items():

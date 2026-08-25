@@ -1,0 +1,36 @@
+# HDB Resale Flat Prices pipeline - Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Everything else imported across pipeline-scripts/05_ETL/*.py and
+# run_pipeline.py (dataclasses, datetime, pathlib, typing, hashlib, json,
+# logging, os, re, sys, time, uuid) is Python 3.10 standard library - no
+# extra install needed for those.
+#
+# Versions are minimums, not exact pins - this project was developed and
+# tested against whatever these resolved to at the time (run
+# `pip freeze > requirements-lock.txt` after installing if you want to
+# capture exact versions for a fully reproducible environment later).
+
+awswrangler==3.14.0  # wr.athena.to_iceberg() / read_sql_query() - all Iceberg read/write in
+                      # common.py. EXACT pin (not a floor, not a range) to match what actually
+                      # runs in AWS Glue, not just what resolves locally - keep the two in sync
+                      # or "works locally, fails in Glue" bugs like these come back:
+                      #   - >=3.0.0 alone is NOT enough: older 3.x releases predate to_iceberg()
+                      #     entirely (Glue's unpinned install hit this gap for real, 2026-08-24).
+                      #   - An open floor (e.g. >=3.17.1) is ALSO not enough: awswrangler 3.15.0+
+                      #     all require Python >=3.10, but Glue Python Shell only offers Python
+                      #     3.9 (no 3.10+ option for that job type) - so pip has zero installable
+                      #     versions once you pin above 3.14.x.
+                      #   - A RANGE (e.g. >=3.9.0,<3.15.0) is ALSO not enough: Glue's own
+                      #     --additional-python-modules argument appears to split on every comma
+                      #     to build its package list, which also splits the comma INSIDE that
+                      #     range spec - handing pip a bare "<3.15.0" as if it were its own
+                      #     package. An exact single pin has no internal comma, so nothing to
+                      #     misparse. 3.14.0 is the newest release confirmed (via the real Glue
+                      #     job's CloudWatch log, 2026-08-24) compatible with Python 3.9, and
+                      #     to_iceberg() exists as far back as 3.2.1, well below it.
+boto3>=1.28.0        # Glue, Athena, S3, STS, SNS, SSM, Lambda, Secrets Manager clients
+pandas>=1.5.0        # dataframe handling across every job_*.py stage
+requests>=2.28.0     # job_1's data.gov.sg API calls (initiate-download / poll-download)

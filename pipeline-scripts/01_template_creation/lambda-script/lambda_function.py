@@ -19,7 +19,7 @@ Meant to be invoked SYNCHRONOUSLY from pipeline_orchestration.ipynb, e.g.:
     )
     metadata = json.loads(resp["Payload"].read())
 
-    # bump a watermark + log a run, get the updated state back
+    # bump a watermark + log ONE run row, get the updated state back
     resp = lambda_client.invoke(
         FunctionName="hdb-eventdriven-metadata-reader",
         InvocationType="RequestResponse",
@@ -29,7 +29,7 @@ Meant to be invoked SYNCHRONOUSLY from pipeline_orchestration.ipynb, e.g.:
                 {"table_id": 1, "last_watermark_value": "2026-08-23T00:00:00", "last_run_id": 101},
             ],
             "pipeline_run": {
-                "run_id": 101, "table_id": 1, "layer": "bronze",
+                "run_id": 101, "table_id": 1, "layer": "job_3_cleaned_iceberg",
                 "start_time": "2026-08-23T00:50:00", "end_time": "2026-08-23T00:53:00",
                 "status": "SUCCEEDED", "number_of_records": 3, "error_message": None,
             },
@@ -37,6 +37,21 @@ Meant to be invoked SYNCHRONOUSLY from pipeline_orchestration.ipynb, e.g.:
     )
     metadata = json.loads(resp["Payload"].read())
     # metadata["tables"] is now the metadata state a following cell can act on
+
+    # OR: log every layer's row for this run in one call, sourced straight
+    # from audit_iceberg's own real rows_out/run_timestamp (used by the
+    # state machine's success-path WriteContext step - see
+    # build_state_machine_definition.py) instead of assembling them by hand:
+    resp = lambda_client.invoke(
+        FunctionName="hdb-eventdriven-metadata-reader",
+        InvocationType="RequestResponse",
+        Payload=json.dumps({
+            "action": "update",
+            "sync_pipeline_runs_from_audit": {
+                "run_id": 101, "since": "2026-08-23T00:45:00", "table_id": 1,
+            },
+        }).encode(),
+    )
 
 Either call's response has the same shape (see lambda_handler's return), which
 is the point of reusing one function instead of a separate read-only /
@@ -241,11 +256,90 @@ def _insert_pipeline_run(run: dict) -> None:
     _run_statement(sql)
 
 
-def _apply_updates(event: dict) -> list:
+# job_1 isn't included: it runs OUTSIDE this state machine (it's what
+# triggers EventBridge -> this state machine in the first place, via its own
+# Glue SUCCEEDED event), so it has no place in "this run's" pipeline_runs
+# rows the way job_2..job_5 do.
+_SYNCED_JOB_NAMES = (
+    "job_2_raw_iceberg", "job_2b_data_profiling", "job_3_cleaned_iceberg",
+    "job_4_transformed_iceberg", "job_5_hashed_iceberg",
+)
+
+
+def _format_run_summary_table(rows: list) -> str:
+    """Plain fixed-width text table (SNS email is plain text, no HTML/SES
+    templating in this build) - one line per layer: LAYER / STATUS /
+    RECORDS / DATE. Used by NotifySuccess's message instead of the old
+    static "trust me" sentence, per the user's explicit ask: "how much
+    failed success, count of each layer and date"."""
+    if not rows:
+        return "(no layers recorded for this run)"
+    header = f"{'LAYER':<28}{'STATUS':<12}{'RECORDS':>10}   DATE"
+    lines = [header, "-" * len(header)]
+    for row in sorted(rows, key=lambda r: r["job_name"]):
+        date_str = str(row["run_timestamp"])[:19]
+        lines.append(f"{row['job_name']:<28}{'SUCCEEDED':<12}{str(row['rows_out']):>10}   {date_str}")
+    return "\n".join(lines)
+
+
+def _sync_pipeline_runs_from_audit(run_id, since_iso: str, table_id: int = 1) -> str:
+    """
+    Reads THIS run's own rows out of audit_iceberg (already written for
+    real by every job_*.py's record_audit() call - see common.py) and turns
+    each into a pipeline_runs row: layer=job_name, number_of_records=
+    rows_out, start_time/end_time=run_timestamp. This is what makes
+    "count of each layer and date" real data instead of something invented
+    here - audit_iceberg is the source of truth, this just re-shapes it
+    into the metadata schema's pipeline_runs table.
+
+    A row only exists in audit_iceberg AFTER a job's real write already
+    succeeded (record_audit() runs near the end of main()), so presence
+    here always means status=SUCCEEDED. A job that crashed before reaching
+    record_audit() has NO row here at all - that's expected, not a bug:
+    failures are written directly from the state machine's own Catch
+    branches (via the plain "pipeline_run" single-insert path above),
+    which have the actual error info audit_iceberg never gets to record.
+    """
+    since_literal = _timestamp_literal(since_iso)
+    job_names_sql = ", ".join(_sql_literal(j) for j in _SYNCED_JOB_NAMES)
+    # BUGFIX (2026-08-25, found via a real execution's update_errors after
+    # every "successful" run kept emailing a blank run-summary table):
+    # audit_iceberg.run_timestamp is written by record_audit() as a plain
+    # formatted string (VARCHAR in Athena's Data Catalog, same as job_5's
+    # own _now_ts() pattern), NOT a native TIMESTAMP column. Comparing it
+    # directly against _timestamp_literal()'s TIMESTAMP '...' literal threw
+    # "TYPE_MISMATCH: Cannot apply operator: varchar <= timestamp(3)" on
+    # every real run - caught by this function's own try/except into
+    # update_errors, so it never crashed the state machine, it just quietly
+    # never wrote anything. CAST(...) the column to TIMESTAMP for the
+    # comparison instead of assuming its stored type.
+    query_id = _run_statement(
+        f'SELECT job_name, rows_out, run_timestamp FROM "{DATABASE}"."audit_iceberg" '
+        f"WHERE CAST(run_timestamp AS TIMESTAMP) >= {since_literal} AND job_name IN ({job_names_sql})"
+    )
+    rows = _fetch_rows_as_dicts(query_id)
+    for row in rows:
+        _insert_pipeline_run({
+            "run_id": run_id,
+            "table_id": table_id,
+            "layer": row["job_name"],
+            "start_time": row["run_timestamp"],
+            "end_time": row["run_timestamp"],
+            "status": "SUCCEEDED",
+            "number_of_records": row["rows_out"],
+            "error_message": None,
+        })
+    return _format_run_summary_table(rows)
+
+
+def _apply_updates(event: dict) -> tuple:
     """Applies every update in the event, collecting (not raising on) errors
     so a partial failure doesn't stop the rest - same "collect and report"
-    approach as _read_all_tables()."""
+    approach as _read_all_tables(). Returns (update_errors, run_summary_table)
+    - the second only populated when a sync_pipeline_runs_from_audit call
+    happened, so NotifySuccess's SNS message has real content to show."""
     update_errors = []
+    run_summary_table = ""
 
     for wm in event.get("watermark_updates", []) or []:
         try:
@@ -253,6 +347,9 @@ def _apply_updates(event: dict) -> list:
         except Exception as exc:  # noqa: BLE001
             update_errors.append({"watermark_update": wm, "error": str(exc)})
 
+    # Single-row insert - used by a Catch branch writing exactly one FAILED
+    # row for the layer that just crashed (has real error info audit_iceberg
+    # never gets to see).
     run = event.get("pipeline_run")
     if run:
         try:
@@ -260,7 +357,28 @@ def _apply_updates(event: dict) -> list:
         except Exception as exc:  # noqa: BLE001
             update_errors.append({"pipeline_run": run, "error": str(exc)})
 
-    return update_errors
+    # Multi-row insert - an explicit list of rows to write as-is, if a
+    # caller already has them assembled.
+    for run in event.get("pipeline_runs", []) or []:
+        try:
+            _insert_pipeline_run(run)
+        except Exception as exc:  # noqa: BLE001
+            update_errors.append({"pipeline_run": run, "error": str(exc)})
+
+    # Success-path convenience: derive every layer's row straight from
+    # audit_iceberg instead of the caller having to assemble them, and get
+    # back a ready-to-email plain-text table summarizing what was written.
+    # sync = {"run_id": 101, "since": "2026-08-25T09:00:00", "table_id": 1}
+    sync = event.get("sync_pipeline_runs_from_audit")
+    if sync:
+        try:
+            run_summary_table = _sync_pipeline_runs_from_audit(
+                run_id=sync["run_id"], since_iso=sync["since"], table_id=sync.get("table_id", 1),
+            )
+        except Exception as exc:  # noqa: BLE001
+            update_errors.append({"sync_pipeline_runs_from_audit": sync, "error": str(exc)})
+
+    return update_errors, run_summary_table
 
 
 # --------------------------------------------------------------------------- #
@@ -271,7 +389,7 @@ def lambda_handler(event, context):
     event = event or {}
     action = event.get("action", "read")
 
-    update_errors = _apply_updates(event) if action == "update" else []
+    update_errors, run_summary_table = _apply_updates(event) if action == "update" else ([], "")
 
     # Both actions return the SAME shape - the calling notebook cell doesn't
     # need to know or care which action it sent, it just reads ["tables"].
@@ -284,6 +402,7 @@ def lambda_handler(event, context):
         "tables": tables,
         "errors": read_errors,
         "update_errors": update_errors,
+        "run_summary_table": run_summary_table,
     }
 
 

@@ -127,10 +127,18 @@ def run_glue_job(job_name: str, glue_client) -> dict:
     start_resp = glue_client.start_job_run(JobName=job_name)
     run_id = start_resp["JobRunId"]
 
+    # Polls every GLUE_POLL_INTERVAL_SECONDS (15s) - a job that runs for
+    # several minutes would otherwise print the same "state=RUNNING" line
+    # dozens of times over. Only print when the state actually CHANGES, so
+    # the log still shows every real transition (STARTING -> RUNNING ->
+    # SUCCEEDED/FAILED) without the repeated no-op lines in between.
+    last_printed_state = None
     while True:
         status = glue_client.get_job_run(JobName=job_name, RunId=run_id)["JobRun"]
         state = status["JobRunState"]
-        print(f"  [{job_name}] run_id={run_id} state={state}")
+        if state != last_printed_state:
+            print(f"  [{job_name}] run_id={run_id} state={state}")
+            last_printed_state = state
         if state in TERMINAL_STATES:
             return status
         time.sleep(GLUE_POLL_INTERVAL_SECONDS)
