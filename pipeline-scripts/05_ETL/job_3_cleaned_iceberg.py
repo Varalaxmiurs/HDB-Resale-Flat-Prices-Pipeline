@@ -44,7 +44,7 @@ from datetime import date
 
 import pandas as pd
 
-from common import get_logger, read_iceberg, record_audit, route_to_failed, write_by_load_type
+from common import compute_surrogate_key, get_logger, read_iceberg, record_audit, route_to_failed, write_by_load_type
 from config import LEASE_YEARS, MIN_CATEGORY_FREQUENCY
 
 logger = get_logger("job_3_cleaned_iceberg")
@@ -230,6 +230,13 @@ def flag_anomalous_price(df: pd.DataFrame) -> pd.Series:
 def main() -> None:
     raw_df = read_iceberg("raw")
     logger.info("Read %d rows from raw_iceberg", len(raw_df))
+
+    # raw_iceberg holds pure source data now - surrogate_key isn't
+    # computed until here, the first stage that actually needs it
+    # (duplicate-key resolution below, then every write_by_load_type()
+    # MERGE from cleaned_iceberg onward). See job_2's main() for why it
+    # moved out of the raw stage.
+    raw_df["surrogate_key"] = compute_surrogate_key(raw_df)
 
     raw_df = normalize_text_columns(raw_df)  # before any validation/dedup - see its docstring
 

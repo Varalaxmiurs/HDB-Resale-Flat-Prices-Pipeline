@@ -12,9 +12,10 @@ combines them into a single dataframe, and writes them into raw_iceberg
 with only the bare minimum transformation needed to make the table usable
 downstream:
     - drop rows that are entirely blank (a rare artifact of source CSVs)
-    - compute the deterministic surrogate_key (SHA-256 of the composite
-      natural key, per common.compute_surrogate_key / config.NATURAL_KEY_COLUMNS)
-      - carried forward by every stage after this one.
+surrogate_key is deliberately NOT computed at this stage anymore - raw_iceberg
+holds pure source data (job_1's landed files, blank rows dropped) with no
+derived columns. It's computed starting at job_3 instead, the first stage
+that actually needs it - see job_3's main().
 
 Written via overwrite_iceberg(), not merge_iceberg(): job_1's source pull is
 always the FULL "Resale Flat Prices" collection, never a delta, so each run
@@ -52,7 +53,7 @@ the source-file read (wr.s3.read_csv over the whole source prefix) and the
 
 import pandas as pd
 
-from common import compute_surrogate_key, get_logger, read_csv_files_from_s3, record_audit, write_by_load_type
+from common import get_logger, read_csv_files_from_s3, record_audit, write_by_load_type
 from config import (
     DATE_RANGE_END,
     DATE_RANGE_START,
@@ -137,8 +138,12 @@ def main() -> None:
         )
         raw_df = raw_df.head(MAX_ROWS_TO_INGEST).copy()
 
-    raw_df["surrogate_key"] = compute_surrogate_key(raw_df)
-
+    # NOTE (raw layer stays pure source data): surrogate_key is NOT
+    # computed here anymore - raw_iceberg now holds only what job_1
+    # landed plus the blank-row drop above, nothing derived. job_3 is the
+    # first stage that actually needs surrogate_key (duplicate-key
+    # resolution, then every write_by_load_type() MERGE from cleaned
+    # onward), so it's computed there instead - see job_3's main().
     write_by_load_type(raw_df, stage="raw", table_id=1)  # FULL/MERGE decided by table_parameters, not hardcoded here
     logger.info(
         "job_2 complete: %d rows loaded into raw_iceberg (%d fully-blank rows dropped)",
