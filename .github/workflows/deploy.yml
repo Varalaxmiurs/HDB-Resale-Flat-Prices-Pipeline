@@ -16,9 +16,17 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ap-southeast-1
+  # Must match setup.sh's actual REGION/BUCKET_PREFIX for THIS account
+  # (544795558120) - previously ap-southeast-1 + a bucket name missing
+  # both the mission- prefix AND the account-ID suffix setup.sh actually
+  # uses, neither of which matched a real run against this account
+  # (setup.sh ran against us-east-1 - see its own terminal output).
+  # BUCKET_PREFIX itself isn't globally unique on its own (S3 bucket
+  # names are a global namespace) - see setup.sh's "BUCKET NAMES"
+  # section comment for why the account ID is baked into the name.
+  AWS_REGION: us-east-1
   AWS_ROLE_ARN: arn:aws:iam::544795558120:role/hdb-pipeline-github-actions
-  PIPELINE_BUCKET: hdb-eventdriven-pipeline-scripts
+  PIPELINE_BUCKET: mission-hdb-eventdriven-544795558120-pipeline-scripts
   PIPELINE_PREFIX: python-scripts
 
 jobs:

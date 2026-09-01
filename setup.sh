@@ -14,8 +14,6 @@ set -Eeuo pipefail
 # ============================================================
 
 PROJECT_NAME="${PROJECT_NAME:-hdb-eventdriven}"
-BUCKET_PREFIX="mission-${PROJECT_NAME}"
-
 
 REGION="${AWS_REGION:-us-east-1}"
 AWS_PROFILE="${AWS_PROFILE:-sujen}"
@@ -27,17 +25,11 @@ ACCOUNT_ID=""
 # ============================================================
 # RESOURCE NAMES
 # ============================================================
-
-BUCKET_PREFIX="mission-${PROJECT_NAME}"
-
-SOURCE_BUCKET="${BUCKET_PREFIX}-source"
-RAW_BUCKET="${BUCKET_PREFIX}-raw"
-CLEANED_BUCKET="${BUCKET_PREFIX}-cleaned"
-TRANSFORMED_BUCKET="${BUCKET_PREFIX}-transformed"
-HASHED_BUCKET="${BUCKET_PREFIX}-hashed"
-FAILED_BUCKET="${BUCKET_PREFIX}-failed"
-PIPELINE_BUCKET="${BUCKET_PREFIX}-pipeline-scripts"
-AUDIT_BUCKET="${BUCKET_PREFIX}-audit-tables"
+# NOTE: BUCKET_PREFIX and every *_BUCKET name are defined further down,
+# AFTER the AWS Account ID is resolved (see "AWS ACCOUNT" section below) -
+# see that section's comment for why. Everything else that doesn't need
+# to be globally unique (Glue database, IAM role names, Glue job names,
+# the Step Functions state machine) is still defined here as before.
 
 GLUE_DATABASE="${PROJECT_NAME//-/_}_database"
 
@@ -237,6 +229,32 @@ fi
 echo "AWS Account       : ${ACCOUNT_ID}"
 echo "AWS Region        : ${REGION}"
 echo ""
+
+# ============================================================
+# BUCKET NAMES (defined here, not at the top of the file)
+# ============================================================
+# S3 bucket names are a GLOBAL namespace shared across every AWS account
+# on Earth, not scoped to this account - "mission-${PROJECT_NAME}-*" alone
+# collided with a bucket some OTHER AWS account already owns
+# (BucketAlreadyExists on create-bucket, even though create_bucket() below
+# had already confirmed via list-buckets that THIS account doesn't have
+# it - list-buckets only sees your own account's buckets, so it can't
+# detect someone else's name collision ahead of time). Suffixing every
+# bucket name with this account's 12-digit ACCOUNT_ID makes collision
+# with anyone else's bucket effectively impossible, since no other AWS
+# account can ever share your account ID. This is why these names are
+# defined here, after ACCOUNT_ID is resolved above, instead of at the top
+# of the file with everything else.
+BUCKET_PREFIX="mission-${PROJECT_NAME}-${ACCOUNT_ID}"
+
+SOURCE_BUCKET="${BUCKET_PREFIX}-source"
+RAW_BUCKET="${BUCKET_PREFIX}-raw"
+CLEANED_BUCKET="${BUCKET_PREFIX}-cleaned"
+TRANSFORMED_BUCKET="${BUCKET_PREFIX}-transformed"
+HASHED_BUCKET="${BUCKET_PREFIX}-hashed"
+FAILED_BUCKET="${BUCKET_PREFIX}-failed"
+PIPELINE_BUCKET="${BUCKET_PREFIX}-pipeline-scripts"
+AUDIT_BUCKET="${BUCKET_PREFIX}-audit-tables"
 
 # ============================================================
 # HELPER - CREATE S3 BUCKET

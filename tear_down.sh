@@ -28,21 +28,28 @@ ACCOUNT_ID="$(
 # BUCKET NAMING
 # ============================================================
 #
-# SETUP USES:
+# SETUP USES (setup.sh, "BUCKET NAMES" section, defined after ACCOUNT_ID
+# is resolved - see that file's comment for why the account ID is in the
+# name at all: S3 bucket names are a GLOBAL namespace, and a bare
+# "mission-${PROJECT_NAME}-*" name collided with some OTHER AWS account's
+# existing bucket for real):
 #
 # PROJECT_NAME="${PROJECT_NAME:-hdb-eventdriven}"
-# BUCKET_PREFIX="mission-${PROJECT_NAME}"
+# BUCKET_PREFIX="mission-${PROJECT_NAME}-${ACCOUNT_ID}"
 #
-# Therefore:
+# Therefore (for account 544795558120):
 #
-# mission-hdb-eventdriven-source
-# mission-hdb-eventdriven-raw
-# mission-hdb-eventdriven-cleaned
+# mission-hdb-eventdriven-544795558120-source
+# mission-hdb-eventdriven-544795558120-raw
+# mission-hdb-eventdriven-544795558120-cleaned
 # etc.
 #
+# Must stay in sync with setup.sh's BUCKET_PREFIX - this file computes it
+# independently rather than sourcing setup.sh, so a change to one needs
+# the same change here.
 # ============================================================
 
-BUCKET_PREFIX="mission-${PROJECT_NAME}"
+BUCKET_PREFIX="mission-${PROJECT_NAME}-${ACCOUNT_ID}"
 
 BUCKETS=(
     "${BUCKET_PREFIX}-source"
