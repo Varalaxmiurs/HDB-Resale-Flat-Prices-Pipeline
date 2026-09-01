@@ -8,7 +8,7 @@ set -Eeuo pipefail
 
 PROJECT_NAME="${PROJECT_NAME:-hdb-eventdriven}"
 
-REGION="${AWS_REGION:-us-east-1}"
+REGION="us-east-1"  # pinned - this pipeline always runs in us-east-1, never overridable via env var (must match setup.sh)
 AWS_PROFILE="${AWS_PROFILE:-sujen}"
 
 # ============================================================
@@ -256,26 +256,24 @@ then
 fi
 
 # ============================================================
-# STEP 2 - DELETE SNS TOPIC
+# STEP 2 - SNS TOPIC (INTENTIONALLY NOT DELETED)
 # ============================================================
+#
+# Deleting the topic here would also delete every subscription on it -
+# SNS has no "detach subscriptions, keep the topic" option, deleting the
+# topic is the only way subscriptions get removed, and it takes every
+# subscriber (real alert recipients, not just test ones) down with it.
+# There's no cost to leaving an idle SNS topic up between teardown/setup
+# cycles, and setup.sh's `aws sns create-topic --name ...` is idempotent -
+# re-running setup against an existing topic name returns that SAME
+# topic's ARN rather than creating a duplicate, so the topic (and every
+# subscription still on it) survives a full teardown -> setup cycle
+# untouched. If you genuinely want the topic itself gone (e.g. final
+# project cleanup, not a test teardown), delete it manually:
+#   aws sns delete-topic --topic-arn "arn:aws:sns:${REGION}:${ACCOUNT_ID}:${SNS_TOPIC_NAME}" --region "${REGION}"
 
 SNS_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${SNS_TOPIC_NAME}"
-
-if aws sns get-topic-attributes \
-    --profile "${AWS_PROFILE}" \
-    --topic-arn "${SNS_TOPIC_ARN}" \
-    --region "${REGION}" \
-    --no-cli-pager >/dev/null 2>&1
-then
-
-    aws sns delete-topic \
-        --profile "${AWS_PROFILE}" \
-        --topic-arn "${SNS_TOPIC_ARN}" \
-        --region "${REGION}" \
-        --no-cli-pager \
-        >/dev/null
-
-fi
+echo "Skipping SNS topic deletion (preserved by design - see STEP 2 comment): ${SNS_TOPIC_ARN}"
 
 # ============================================================
 # STEP 3 - DELETE LAMBDA FUNCTION
@@ -752,7 +750,7 @@ echo "  Glue IAM Role"
 echo "  EventBridge IAM Role"
 echo "  Step Functions IAM Role"
 echo "  GitHub Actions IAM Role"
-echo "  SNS Topic"
+echo "  SNS Topic (preserved - subscriptions kept, not deleted)"
 echo "  EventBridge Rule"
 echo "  Ingestion-Complete Trigger Rule"
 
