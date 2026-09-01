@@ -11,6 +11,16 @@ overlapping the required date range, then for each: initiate-download ->
 poll-download -> stream the CSV straight into S3, byte-for-byte as
 downloaded. No parsing, no cleaning - that happens in later stages.
 
+Datasets are ingested in small concurrent batches (see
+config.MAX_CONCURRENT_DOWNLOADS), not one at a time - most of each
+dataset's time is spent waiting on poll-download, so overlapping a few
+datasets is what actually fixes "ingestion is slow" without hammering
+the API into more rate-limiting than it already does at low concurrency.
+Files are landed one-per-dataset (not merged here): job_2 already reads
+and concatenates every CSV under the source prefix into one dataframe,
+so a physical merge at this stage would only lose per-dataset raw-file
+traceability for no benefit.
+
 IMPORTANT: verify the initiate/poll-download domain & response shape
 against https://guide.data.gov.sg before a production run - docs showed
 this on api-open.data.gov.sg/v1 vs the v2 api-production domain used for
@@ -19,6 +29,7 @@ collection metadata.
 
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import List, Tuple
@@ -35,6 +46,7 @@ from config import (
     DATE_RANGE_START,
     LOOKBACK_WINDOW_DAYS,
     MAX_API_RETRIES,
+    MAX_CONCURRENT_DOWNLOADS,
     MAX_DATASETS_TO_INGEST,
     POLL_INTERVAL_SECONDS,
     POLL_TIMEOUT_SECONDS,
@@ -225,6 +237,48 @@ def resolve_effective_date_range() -> Tuple[date, date]:
     return effective_start, full_end
 
 
+def _ingest_one_dataset(d: "DatasetRef") -> str:
+    """initiate -> poll -> stream-to-S3 for a single dataset. Pulled out
+    of the main loop so it can be handed to a thread-pool worker as-is -
+    each call is fully independent (its own dataset_id, its own HTTP
+    calls), which is exactly what makes this safe to run concurrently."""
+    initiate_download(d.dataset_id)
+    url = poll_download(d.dataset_id)
+    return download_to_source(d.dataset_id, url)
+
+
+def _ingest_datasets_in_batches(datasets: List["DatasetRef"], max_concurrent: int) -> List[str]:
+    """Batch ingestion: run up to `max_concurrent` datasets' initiate ->
+    poll -> download pipelines at the same time, instead of one dataset
+    fully finishing before the next starts.
+
+    Why bounded rather than "just run them all at once": see
+    config.MAX_CONCURRENT_DOWNLOADS's docstring - the data.gov.sg API has
+    already shown 429s with as few as 2 overlapping requests, so a small
+    batch size (default 3) is chosen to overlap the slow part (each
+    dataset's poll-download wait) without hammering the API. The existing
+    per-request 429 retry/backoff in _get_with_retry() still applies on
+    top of this for whatever contention does happen.
+
+    Order of the returned list is NOT guaranteed to match `datasets`'
+    order (results land in completion order, not submission order) - job_2
+    reads every CSV under the whole source prefix as one combined
+    dataframe regardless of file order, so this doesn't matter downstream.
+    Fails fast: the first dataset that raises stops the run and the
+    exception propagates, same behavior as the previous sequential loop.
+    """
+    source_paths: List[str] = []
+    with ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+        futures = {pool.submit(_ingest_one_dataset, d): d for d in datasets}
+        for future in as_completed(futures):
+            d = futures[future]
+            path = future.result()  # re-raises here if _ingest_one_dataset failed
+            logger.info("Batch ingestion progress: %d/%d datasets landed (just finished %s)",
+                        len(source_paths) + 1, len(datasets), d.dataset_id)
+            source_paths.append(path)
+    return source_paths
+
+
 def main() -> List[str]:
     datasets = get_collection_datasets(COLLECTION_ID)
     range_start, range_end = resolve_effective_date_range()
@@ -241,17 +295,7 @@ def main() -> List[str]:
         )
         matching = matching[:MAX_DATASETS_TO_INGEST]
 
-    source_paths = []
-    for i, d in enumerate(matching):
-        if i > 0:
-            # Small courtesy gap between datasets, on top of the 429
-            # retry logic above - reduces how often we hit the rate
-            # limit in the first place rather than only reacting to it
-            # after the fact.
-            time.sleep(1)
-        initiate_download(d.dataset_id)
-        url = poll_download(d.dataset_id)
-        source_paths.append(download_to_source(d.dataset_id, url))
+    source_paths = _ingest_datasets_in_batches(matching, MAX_CONCURRENT_DOWNLOADS)
 
     logger.info("job_1 complete: %d source files landed", len(source_paths))
     record_audit(

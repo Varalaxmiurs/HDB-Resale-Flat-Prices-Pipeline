@@ -243,6 +243,41 @@ REQUEST_TIMEOUT_SECONDS = _env_int("HDB_REQUEST_TIMEOUT_SECONDS", 30)
 MAX_API_RETRIES = _env_int("HDB_MAX_API_RETRIES", 5)
 RETRY_BACKOFF_BASE_SECONDS = _env_int("HDB_RETRY_BACKOFF_BASE_SECONDS", 2)
 
+# job_1 used to process datasets fully sequentially (one dataset's
+# initiate -> poll -> download -> upload finished before the next one's
+# even started, plus a 1s courtesy gap). For a collection with several
+# datasets, each with its own multi-second-to-multi-minute poll wait,
+# that adds up to roughly the SUM of every dataset's time. Processing a
+# small batch concurrently instead turns that into roughly the MAX of
+# one batch's time, which is the actual fix for "ingestion is slow".
+#
+# This is deliberately NOT unbounded parallelism: the comment above
+# (MAX_API_RETRIES) documents a real 429 seen with just 2 overlapping
+# requests, so firing off every dataset's initiate-download at once
+# would likely make rate-limiting worse, not better. A small, bounded
+# batch size lets several datasets' downloads overlap (the real time
+# saver, since most of each dataset's time is spent waiting on
+# poll-download, not on CPU work) while the existing 429 retry/backoff
+# logic absorbs whatever contention does happen.
+MAX_CONCURRENT_DOWNLOADS = _env_int("HDB_MAX_CONCURRENT_DOWNLOADS", 3)
+
+# Same idea as MAX_CONCURRENT_DOWNLOADS above, but for reading files back
+# OUT of S3 (job_2's read_csv_files_from_s3, landing-zone -> raw stage) -
+# these are our own S3 objects, not a rate-limited public API, so a
+# higher default is safe.
+MAX_CONCURRENT_S3_READS = _env_int("HDB_MAX_CONCURRENT_S3_READS", 8)
+
+# Bounded concurrency for the Athena INSERT batches that load a dataframe
+# into an Iceberg table (common._insert_iceberg_rows). Kept LOW (not high
+# like MAX_CONCURRENT_S3_READS) on purpose: Iceberg table commits are
+# optimistic-concurrency-controlled - two INSERTs committing to the SAME
+# table at the same moment can collide, and one has to lose and retry
+# (see _execute_athena_insert_batch()'s retry-on-conflict logic). A small
+# concurrency still overlaps each query's multi-second Athena startup/
+# planning latency (the real time cost, not the actual data volume) while
+# keeping collisions rare and cheap to retry.
+MAX_CONCURRENT_ATHENA_INSERTS = _env_int("HDB_MAX_CONCURRENT_ATHENA_INSERTS", 4)
+
 # Testing knob: cap how many datasets job_1 actually downloads/ingests,
 # regardless of how many the date range matches. 0 (default) = no cap,
 # ingest everything the range matches - the real run. Set
