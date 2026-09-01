@@ -127,16 +127,50 @@ def _env_or_ssm(env_key: str, ssm_name: str, default: str) -> str:
 # Reads the SAME PROJECT_NAME env var setup.sh/tear_down.sh read (falls back to
 # HDB_PROJECT_NAME for a Python-only override), so exporting ONE variable before
 # running either setup.sh or the Python pipeline points BOTH at the same
-# isolated environment - e.g. a parallel test deployment in another region:
+# isolated environment - e.g. a parallel test deployment with a different name:
 #     export PROJECT_NAME=hdb-eventdriven-test
-#     export AWS_REGION=ap-southeast-1
-#     bash setup.sh                 # provisions mission-hdb-eventdriven-test-*
+#     bash setup.sh                 # provisions mission-hdb-eventdriven-test-<account-id>-*
 #     python run_pipeline.py        # now targets the SAME -test- resources
+# AWS_REGION is NOT part of this - it's pinned to us-east-1 below and is not
+# meant to be overridden (see AWS_REGION's own comment for why: a region
+# mismatch between setup.sh and the Python jobs already caused a real
+# incident, and an old version of this comment recommending
+# `export AWS_REGION=ap-southeast-1` as a test-deployment example is very
+# likely how that mismatch happened for real in deploy.yml).
 # Every individual HDB_*_BUCKET / HDB_GLUE_DATABASE / HDB_SNS_TOPIC_NAME env
 # var below still overrides its own derived default individually, same as
 # always - this just changes what the DEFAULT is when you have not set one.
 PROJECT_NAME = _env("PROJECT_NAME", _env("HDB_PROJECT_NAME", "hdb-eventdriven"))
-_BUCKET_PREFIX = f"mission-{PROJECT_NAME}"
+_account_id_cache = None
+
+
+def _get_account_id() -> str:
+    """Lazily resolves this AWS account's id live via STS - same call
+    `aws sts get-caller-identity` makes, and the same thing
+    common.py's get_account_id() does (duplicated here rather than
+    imported: common.py imports FROM this file, so importing back the
+    other way would be circular). Cached per-process.
+
+    Falls back to a clearly-fake placeholder on any failure (no AWS
+    credentials - offline unit tests, deploy.yml's py_compile syntax
+    check, local dev before `aws configure`) rather than crashing every
+    job at import time - same reasoning as _env_or_ssm() above. Only a
+    real run with real credentials needs the real id: it exists purely
+    to make the bucket names below globally-unique-safe (S3 bucket names
+    are a global namespace - see setup.sh's "BUCKET NAMES" section for
+    the real BucketAlreadyExists collision that made this necessary)."""
+    global _account_id_cache
+    if _account_id_cache is None:
+        try:
+            _account_id_cache = boto3.client("sts").get_caller_identity()["Account"]
+        except Exception:
+            _account_id_cache = "000000000000"
+    return _account_id_cache
+
+
+# Must match setup.sh's BUCKET_PREFIX exactly (mission-<project>-<account-id>) -
+# see that file's "BUCKET NAMES" section for why the account id is in here.
+_BUCKET_PREFIX = f"mission-{PROJECT_NAME}-{_get_account_id()}"
 _DEFAULT_GLUE_DATABASE = f"{PROJECT_NAME.replace('-', '_')}_database"
 _DEFAULT_SNS_TOPIC_NAME = f"{PROJECT_NAME}-notifications"
 
@@ -144,15 +178,17 @@ _DEFAULT_SNS_TOPIC_NAME = f"{PROJECT_NAME}-notifications"
 # AWS region / Glue Catalog / Athena
 # --------------------------------------------------------------------------- #
 
-# Checks the plain AWS_REGION env var FIRST (same name setup.sh and boto3
-# itself look for), falling back to the project-specific HDB_AWS_REGION
-# override, then the hardcoded default. setup.sh reads "${AWS_REGION:-...}"
-# directly - if this read HDB_AWS_REGION only, a shell that had AWS_REGION
-# set (but not HDB_AWS_REGION) would make setup.sh provision everything in
-# one region while every Python job assumed a different one. That exact
-# split was the root cause of a whole run of "Iceberg cannot find the
-# requested entity" / "S3 location ... not in the same region" failures.
-AWS_REGION = _env("AWS_REGION", _env("HDB_AWS_REGION", "us-east-1"))
+# PINNED to us-east-1, not overridable via env var - matches setup.sh and
+# tear_down.sh, which are pinned the same way. This used to be overridable
+# (AWS_REGION env var, falling back to HDB_AWS_REGION, falling back to a
+# "us-east-1" default) specifically so setup.sh and every Python job would
+# always agree on region even if someone customized it - but a mismatch
+# STILL happened for real (deploy.yml ended up pointed at ap-southeast-1
+# while setup.sh actually provisioned us-east-1), which caused a real run
+# of "Iceberg cannot find the requested entity" / "S3 location ... not in
+# the same region" failures. Overridable-but-must-agree-everywhere turned
+# out to be a trap - pinning it in one place with no override is safer.
+AWS_REGION = "us-east-1"
 
 GLUE_DATABASE = _env("HDB_GLUE_DATABASE", _DEFAULT_GLUE_DATABASE)
 ATHENA_WORKGROUP = _env("HDB_ATHENA_WORKGROUP", "primary")  # must be engine v3 for Iceberg MERGE/UPDATE
